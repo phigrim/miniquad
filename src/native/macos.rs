@@ -4,11 +4,11 @@
 //!
 use {
     crate::{
-        conf::{AppleGfxApi, Icon},
+        conf::{GfxApi, Icon},
         event::{EventHandler, MouseButton},
         native::{
             apple::{apple_util::*, frameworks::*},
-            gl, NativeDisplayData, Request,
+            NativeDisplayData, Request,
         },
         native_display, CursorIcon,
     },
@@ -22,6 +22,9 @@ use {
         time::{Duration, Instant},
     },
 };
+
+#[cfg(feature = "opengl")]
+use crate::native::gl;
 
 pub struct MacosDisplay {
     window: ObjcId,
@@ -37,7 +40,7 @@ pub struct MacosDisplay {
     current_cursor: CursorIcon,
     cursor_grabbed: bool,
     cursors: HashMap<CursorIcon, ObjcId>,
-    gfx_api: crate::conf::AppleGfxApi,
+    gfx_api: crate::conf::GfxApi,
 
     event_handler: Option<Box<dyn EventHandler>>,
     f: Option<Box<dyn 'static + FnOnce() -> Box<dyn EventHandler>>>,
@@ -220,6 +223,7 @@ impl MacosDisplay {
 
     unsafe fn update_dimensions(&mut self) -> Option<(i32, i32)> {
         let mut d = native_display().lock().unwrap();
+        #[cfg(feature = "opengl")]
         unsafe {
             if self.gl_context != nil {
                 msg_send_![self.gl_context, update];
@@ -463,6 +467,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
 
     extern "C" fn window_did_move(this: &Object, _: Sel, _: ObjcId) {
         let payload = get_window_payload(this);
+        #[cfg(feature = "opengl")]
         if payload.gl_context.is_null() {
             // Startup: the gl_context has not yet been created.
             return;
@@ -470,6 +475,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
         if let Some(event_handler) = payload.context() {
             event_handler.window_minimized_event();
         }
+        #[cfg(feature = "opengl")]
         unsafe {
             msg_send_![payload.gl_context, update];
         }
@@ -563,6 +569,7 @@ pub fn define_cocoa_window_delegate() -> *const Class {
     decl.register()
 }
 
+#[cfg(feature = "opengl")]
 unsafe fn get_proc_address(name: *const u8) -> Option<unsafe extern "C" fn()> {
     mod libc {
         use std::ffi::{c_char, c_int, c_void};
@@ -1183,6 +1190,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     );
 }
 
+#[cfg(feature = "opengl")]
 pub fn define_opengl_view_class() -> *const Class {
     extern "C" fn reshape(this: &Object, _sel: Sel) {
         let payload = get_window_payload(this);
@@ -1209,7 +1217,8 @@ pub fn define_opengl_view_class() -> *const Class {
             let current_mode: ObjcId = msg_send![current_runloop, currentMode];
             // Not checking name, assuming that this is NSEventTrackingRunLoopMode
             if current_mode != nil {
-                perform_redraw(payload, AppleGfxApi::OpenGl, true);
+                #[cfg(feature = "opengl")]
+                perform_redraw(payload, GfxApi::OpenGl, true);
             }
         }
     }
@@ -1245,20 +1254,22 @@ pub fn define_opengl_view_class() -> *const Class {
     decl.register()
 }
 
+#[cfg(feature = "metal")]
 pub fn define_metal_view_class() -> *const Class {
     let superclass = class!(MTKView);
     let mut decl = ClassDecl::new("RenderViewClass", superclass).unwrap();
     decl.add_ivar::<*mut c_void>("display_ptr");
 
     extern "C" fn draw_rect(this: &Object, _sel: Sel, _: ObjcId) {
-        let payload = get_window_payload(this);
+        let _payload = get_window_payload(this);
         unsafe {
             let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
             let current_mode: ObjcId = msg_send![current_runloop, currentMode];
             // Not checking name, assuming that this is NSEventTrackingRunLoopMode
             // For metal backend this is nil during regular draw_rect calls
             if current_mode != nil {
-                perform_redraw(payload, AppleGfxApi::Metal, true);
+                #[cfg(feature = "metal")]
+                perform_redraw(_payload, GfxApi::Metal, true);
             }
         }
     }
@@ -1281,6 +1292,7 @@ fn get_window_payload(this: &Object) -> &mut MacosDisplay {
     }
 }
 
+#[cfg(feature = "metal")]
 unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) -> ObjcId {
     let mtl_device_obj = MTLCreateSystemDefaultDevice();
     let view_class = define_metal_view_class();
@@ -1300,6 +1312,7 @@ unsafe fn create_metal_view(_: &mut MacosDisplay, sample_count: i32, _: bool) ->
 }
 
 #[allow(clippy::vec_init_then_push)]
+#[cfg(feature = "opengl")]
 unsafe fn create_opengl_view(
     display: &mut MacosDisplay,
     sample_count: i32,
@@ -1566,8 +1579,8 @@ unsafe fn initialize_menu_bar(ns_app: ObjcId) {
 
 unsafe fn perform_redraw(
     display: &mut MacosDisplay,
-    apple_gfx_api: AppleGfxApi,
-    in_draw_rect: bool,
+    gfx_api: GfxApi,
+    _in_draw_rect: bool,
 ) {
     if display.event_handler.is_none() {
         let f = display.f.take().unwrap();
@@ -1608,12 +1621,14 @@ unsafe fn perform_redraw(
                 }
             }
         }
-        match apple_gfx_api {
-            AppleGfxApi::OpenGl => {
+        match gfx_api {
+            #[cfg(feature = "opengl")]
+            GfxApi::OpenGl => {
                 msg_send_!(display.gl_context, flushBuffer);
             }
-            AppleGfxApi::Metal => {
-                if !in_draw_rect {
+            #[cfg(feature = "metal")]
+            GfxApi::Metal => {
+                if !_in_draw_rect {
                     msg_send_!(display.view, draw);
                 }
             }
@@ -1629,7 +1644,7 @@ where
     let clipboard = Box::new(MacosClipboard);
     crate::set_display(NativeDisplayData {
         high_dpi: conf.high_dpi,
-        gfx_api: conf.platform.apple_gfx_api,
+        gfx_api: conf.platform.prefer_gfx_api,
         blocking_event_loop: conf.platform.blocking_event_loop,
         ..NativeDisplayData::new(conf.window_width, conf.window_height, tx, clipboard)
     });
@@ -1644,7 +1659,7 @@ where
         current_cursor: CursorIcon::Default,
         cursor_grabbed: false,
         cursors: HashMap::new(),
-        gfx_api: conf.platform.apple_gfx_api,
+        gfx_api: conf.platform.prefer_gfx_api,
         f: Some(Box::new(f)),
         event_handler: None,
         native_requests: rx,
@@ -1710,9 +1725,11 @@ where
     //let () = msg_send![window, setReleasedWhenClosed: NO];
     let () = msg_send![window, setTitle: title];
 
-    let view = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
-        AppleGfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
+    let view = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "opengl")]
+        GfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
+        #[cfg(feature = "metal")]
+        GfxApi::Metal => create_metal_view(&mut display, conf.sample_count, conf.high_dpi),
     };
     {
         let mut d = native_display().lock().unwrap();
@@ -1729,7 +1746,8 @@ where
     display.view = view;
 
     // cannot place it to create_opengl_view, because it should be called after setContentView
-    if conf.platform.apple_gfx_api == AppleGfxApi::OpenGl {
+    #[cfg(feature = "opengl")]
+    if conf.platform.prefer_gfx_api == GfxApi::OpenGl {
         msg_send_![display.gl_context, setView:view];
         msg_send_![display.gl_context, makeCurrentContext];
 
@@ -1761,13 +1779,15 @@ where
 
     // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
     let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
-    let timer = match conf.platform.apple_gfx_api {
-        AppleGfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+    let timer = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "opengl")]
+        GfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
                                                            target:view
                                                            selector:sel!(setNeedsDisplayHack)
                                                            userInfo:nil
                                                            repeats:YES],
-        AppleGfxApi::Metal => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
+        #[cfg(feature = "metal")]
+        GfxApi::Metal => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
                                                           target:view
                                                           selector:sel!(draw)
                                                           userInfo:nil
@@ -1824,7 +1844,7 @@ where
         }
 
         if !conf.platform.blocking_event_loop || display.update_requested {
-            perform_redraw(&mut display, conf.platform.apple_gfx_api, false);
+            perform_redraw(&mut display, conf.platform.prefer_gfx_api, false);
         }
 
     }

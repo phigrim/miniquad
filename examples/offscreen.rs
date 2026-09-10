@@ -213,14 +213,11 @@ impl EventHandler for Stage {
     }
 }
 
+mod support;
+
 fn main() {
     let mut conf = conf::Conf::default();
-    let metal = std::env::args().nth(1).as_deref() == Some("metal");
-    conf.platform.apple_gfx_api = if metal {
-        conf::AppleGfxApi::Metal
-    } else {
-        conf::AppleGfxApi::OpenGl
-    };
+    support::configure(&mut conf);
 
     miniquad::start(conf, move || Box::new(Stage::new()));
 }

@@ -72,19 +72,35 @@ pub enum LinuxBackend {
     WaylandWithX11Fallback,
 }
 
-/// On Apple platforms, choose the rendering API for creating contexts.
+/// A graphics API available to miniquad.
 ///
-/// Miniquad always links to Metal.framework (assuming it's present),
-/// and links to OpenGL dynamically only if required.
-///
-/// Defaults to AppleGfxApi::GL for legacy reasons.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
-pub enum AppleGfxApi {
-    /// Use OpenGL for Apple platforms. This is the default choice.
-    #[default]
+/// On Apple platforms, the variants are controlled by Cargo features. OpenGL
+/// is enabled by default and Metal is enabled with the `metal` feature.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum GfxApi {
+    /// Use OpenGL.
+    #[cfg(any(not(target_vendor = "apple"), feature = "opengl"))]
     OpenGl,
-    /// Use Metal for Apple platforms.
+    /// Use Metal on Apple platforms.
+    #[cfg(all(target_vendor = "apple", feature = "metal"))]
     Metal,
+}
+
+impl Default for GfxApi {
+    #[cfg(any(not(target_vendor = "apple"), feature = "opengl"))]
+    fn default() -> Self {
+        Self::OpenGl
+    }
+
+    #[cfg(all(target_vendor = "apple", not(feature = "opengl"), feature = "metal"))]
+    fn default() -> Self {
+        Self::Metal
+    }
+
+    #[cfg(all(target_vendor = "apple", not(feature = "opengl"), not(feature = "metal")))]
+    fn default() -> Self {
+        unreachable!("an Apple graphics backend feature must be enabled")
+    }
 }
 
 /// On the Web, specify which WebGL version to use.
@@ -129,8 +145,8 @@ pub struct Platform {
     /// Specifies which WebGL version to use on the Web (1.0. or 2.0).
     pub webgl_version: WebGLVersion,
 
-    /// Defines which rendering API to use on Apple platforms (Metal or OpenGL).
-    pub apple_gfx_api: AppleGfxApi,
+    /// Defines which available rendering API should be preferred on Apple platforms.
+    pub prefer_gfx_api: GfxApi,
 
     /// Optional swap interval (vertical sync).
     ///
@@ -188,7 +204,7 @@ impl Default for Platform {
         Platform {
             linux_x11_gl: LinuxX11Gl::default(),
             linux_backend: LinuxBackend::default(),
-            apple_gfx_api: AppleGfxApi::default(),
+            prefer_gfx_api: GfxApi::default(),
             webgl_version: WebGLVersion::default(),
             blocking_event_loop: false,
             sleep_interval_ms: None,

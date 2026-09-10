@@ -4,7 +4,7 @@
 //!
 use {
     crate::{
-        conf::{self, AppleGfxApi, Conf},
+        conf::{self, Conf, GfxApi},
         event::{EventHandler, KeyCode, KeyMods, TouchPhase},
         fs,
         native::{
@@ -20,7 +20,6 @@ use {
         cell::RefCell,
         os::raw::c_void,
         sync::{mpsc, Arc, Mutex},
-        thread::{self},
     },
 };
 
@@ -41,12 +40,14 @@ struct IosDisplay {
     _textfield_dlg: ObjcId,
     textfield: ObjcId,
     current_element_id: u64,
-    gfx_api: conf::AppleGfxApi,
+    gfx_api: conf::GfxApi,
 
     event_handler: Option<Box<dyn EventHandler>>,
     _gles2: bool,
     f: Option<Box<dyn 'static + FnOnce() -> Box<dyn EventHandler>>>,
     state: Arc<Mutex<MainThreadState>>,
+    messages_rx: mpsc::Receiver<Message>,
+    requests_rx: mpsc::Receiver<crate::native::Request>,
 }
 
 impl IosDisplay {
@@ -63,7 +64,8 @@ impl IosDisplay {
     fn init_event_handler(&mut self) {
         let f = self.f.take().unwrap();
 
-        if self.gfx_api == AppleGfxApi::OpenGl {
+        #[cfg(feature = "opengl")]
+        if self.gfx_api == GfxApi::OpenGl {
             crate::native::gl::load_gl_funcs(|proc| {
                 let name = std::ffi::CString::new(proc).unwrap();
 
@@ -112,7 +114,7 @@ fn dispatch_message(payload: &mut IosDisplay, msg: Message) {
         } => {
             payload.state.lock().unwrap().update_requested = true;
             if let Some(ref mut event_handler) = payload.event_handler {
-                event_handler.touch_event(phase, touch_id, x, y);
+                event_handler.touch_event(phase, touch_id, x, y, 0.0);
             }
         }
         Message::Character { character } => {
@@ -377,71 +379,9 @@ pub fn define_glk_or_mtk_view(superclass: &Class) -> *const Class {
         }
         let msg = {
             let state = payload.state.lock().unwrap();
-            state.cur_msg
+            state.cur_msg.clone()
         };
-        match msg {
-            Message::Pause => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = true;
-            }
-            Message::Resume => {
-                let mut state = payload.state.lock().unwrap();
-                state.paused = false;
-            }
-            Message::Destroy => {
-                let mut state = payload.state.lock().unwrap();
-                state.quit = true;
-            }
-            Message::Touch {
-                phase,
-                touch_id,
-                x,
-                y,
-            } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    let timestamp: f64 = msg_send![ios_touch, timestamp];
-                    event_handler.touch_event(phase, touch_id, x, y, timestamp);
-                }
-            }
-            Message::Character { character } => {
-                if let Some(character) = char::from_u32(character) {
-                    if let Some(ref mut event_handler) = payload.event_handler {
-                        event_handler.char_event(character, Default::default(), false);
-                    }
-                }
-            }
-            Message::KeyDown { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = true,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = true,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = true,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = true,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_down_event(keycode, state.keymods, false);
-                }
-            }
-            Message::KeyUp { keycode } => {
-                let mut state = payload.state.lock().unwrap();
-                match keycode {
-                    KeyCode::LeftShift | KeyCode::RightShift => state.keymods.shift = false,
-                    KeyCode::LeftControl | KeyCode::RightControl => state.keymods.ctrl = false,
-                    KeyCode::LeftAlt | KeyCode::RightAlt => state.keymods.alt = false,
-                    KeyCode::LeftSuper | KeyCode::RightSuper => state.keymods.logo = false,
-                    _ => {}
-                }
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.key_up_event(keycode, state.keymods);
-                }
-            }
-            Message::Resize { width, height } => {
-                if let Some(ref mut event_handler) = payload.event_handler {
-                    event_handler.resize_event(width as _, height as _);
-                }
-            }
-        }
+        dispatch_message(payload, msg);
     }
 
     unsafe {
@@ -613,16 +553,19 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
             return;
         }
 
-        if payload.blocking_event_loop && !payload.state.lock().unwrap().update_requested {
+        let blocking_event_loop = native_display().lock().unwrap().blocking_event_loop;
+        if blocking_event_loop && !payload.state.lock().unwrap().update_requested {
             return;
         }
 
         unsafe {
             match payload.gfx_api {
-                AppleGfxApi::Metal => {
+                #[cfg(feature = "metal")]
+                GfxApi::Metal => {
                     let _: () = msg_send![payload.view, draw];
                 }
-                AppleGfxApi::OpenGl => {
+                #[cfg(feature = "opengl")]
+                GfxApi::OpenGl => {
                     let _: () = msg_send![payload.view, display];
                 }
             }
@@ -744,6 +687,7 @@ struct View {
     _gles2: bool,
 }
 
+#[cfg(feature = "opengl")]
 unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: bool) -> View {
     let container_view: ObjcId = msg_send![class!(UIView), alloc];
     let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
@@ -819,6 +763,7 @@ unsafe fn create_opengl_view(screen_rect: NSRect, _sample_count: i32, high_dpi: 
     }
 }
 
+#[cfg(feature = "metal")]
 unsafe fn create_metal_view(screen_rect: NSRect, sample_count: i32, _high_dpi: bool) -> View {
     let container_view: ObjcId = msg_send![class!(UIView), alloc];
     let container_view: ObjcId = msg_send![container_view, initWithFrame: screen_rect];
@@ -923,7 +868,7 @@ pub fn define_app_delegate() -> *const Class {
     }
 
     extern "C" fn did_finish_launching_with_options(
-        _: &Object,
+        delegate_self: &Object,
         _: Sel,
         _: ObjcId,
         _: ObjcId,
@@ -942,14 +887,13 @@ pub fn define_app_delegate() -> *const Class {
             let screen_width = (screen_rect.size.width * scale) as i32;
             let screen_height = (screen_rect.size.height * scale) as i32;
 
-            let window_obj: ObjcId = msg_send![class!(UIWindow), alloc];
-            let window_obj: ObjcId = msg_send![window_obj, initWithFrame: screen_rect];
-
-            let view = match conf.platform.apple_gfx_api {
-                AppleGfxApi::OpenGl => {
+            let view = match conf.platform.prefer_gfx_api {
+                #[cfg(feature = "opengl")]
+                GfxApi::OpenGl => {
                     create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi)
                 }
-                AppleGfxApi::Metal => {
+                #[cfg(feature = "metal")]
+                GfxApi::Metal => {
                     create_metal_view(screen_rect, conf.sample_count, conf.high_dpi)
                 }
             };
@@ -1028,7 +972,7 @@ pub fn define_app_delegate() -> *const Class {
             crate::set_display(NativeDisplayData {
                 high_dpi: conf.high_dpi,
                 dpi_scale: scale as f32,
-                gfx_api: conf.platform.apple_gfx_api,
+                gfx_api: conf.platform.prefer_gfx_api,
                 blocking_event_loop: conf.platform.blocking_event_loop,
                 view: view.view,
                 ..NativeDisplayData::new(screen_width, screen_height, tx, clipboard)
@@ -1056,12 +1000,14 @@ pub fn define_app_delegate() -> *const Class {
                 textfield,
                 _textfield_dlg: textfield_dlg,
                 current_element_id: 0,
-                gfx_api: conf.platform.apple_gfx_api,
+                gfx_api: conf.platform.prefer_gfx_api,
 
                 f: Some(Box::new(f)),
                 event_handler: None,
                 _gles2: view._gles2,
                 state: state_original.clone(),
+                messages_rx: rx,
+                requests_rx,
             });
             let payload_ptr = Box::into_raw(payload) as *mut std::ffi::c_void;
 

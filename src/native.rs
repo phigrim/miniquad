@@ -30,7 +30,7 @@ pub(crate) struct NativeDisplayData {
     #[cfg(target_os = "ios")]
     pub view_ctrl: crate::native::apple::frameworks::ObjcId,
     #[cfg(target_vendor = "apple")]
-    pub gfx_api: crate::conf::AppleGfxApi,
+    pub gfx_api: crate::conf::GfxApi,
 }
 #[cfg(target_vendor = "apple")]
 unsafe impl Send for NativeDisplayData {}
@@ -59,7 +59,7 @@ impl NativeDisplayData {
             dropped_files: Default::default(),
             blocking_event_loop: false,
             #[cfg(target_vendor = "apple")]
-            gfx_api: crate::conf::AppleGfxApi::OpenGl,
+            gfx_api: crate::conf::GfxApi::default(),
             #[cfg(target_vendor = "apple")]
             view: std::ptr::null_mut(),
             #[cfg(target_os = "ios")]

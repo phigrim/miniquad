@@ -12,6 +12,13 @@ mod event;
 pub mod fs;
 pub mod graphics;
 pub mod native;
+
+#[cfg(all(
+    target_vendor = "apple",
+    not(feature = "opengl"),
+    not(feature = "metal")
+))]
+compile_error!("miniquad requires at least one Apple graphics backend feature: `opengl` or `metal`");
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
 
@@ -128,26 +135,30 @@ fn native_display() -> &'static Mutex<native::NativeDisplayData> {
 pub mod window {
     use super::*;
 
-    /// The same as
-    /// ```ignore
-    /// if metal {
-    ///    Box::new(MetalContext::new())
-    /// } else {
-    ///   Box::new(GlContext::new())
-    /// };
-    /// ```
-    /// but under #[cfg] gate to avoid MetalContext on non-apple platforms
+    /// Creates the rendering backend selected by the native platform.
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
         #[cfg(target_vendor = "apple")]
         {
-            if window::apple_gfx_api() == conf::AppleGfxApi::Metal {
-                Box::new(MetalContext::new())
-            } else {
-                Box::new(GlContext::new())
+            match window::gfx_api() {
+                #[cfg(feature = "metal")]
+                conf::GfxApi::Metal => {
+                    Box::new(MetalContext::new())
+                }
+                #[cfg(feature = "opengl")]
+                conf::GfxApi::OpenGl => Box::new(GlContext::new()),
             }
         }
         #[cfg(not(target_vendor = "apple"))]
-        Box::new(GlContext::new())
+        {
+            Box::new(GlContext::new())
+        }
+    }
+
+    /// The currently selected graphics API on Apple platforms.
+    #[cfg(target_vendor = "apple")]
+    pub fn gfx_api() -> crate::conf::GfxApi {
+        let d = native_display().lock().unwrap();
+        d.gfx_api
     }
 
     /// The current framebuffer size in pixels
@@ -480,11 +491,6 @@ pub mod window {
         d.ime_enabled
     }
 
-    #[cfg(target_vendor = "apple")]
-    pub fn apple_gfx_api() -> crate::conf::AppleGfxApi {
-        let d = native_display().lock().unwrap();
-        d.gfx_api
-    }
     #[cfg(target_vendor = "apple")]
     pub fn apple_view() -> crate::native::apple::frameworks::ObjcId {
         let d = native_display().lock().unwrap();

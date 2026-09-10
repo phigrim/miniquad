@@ -17,6 +17,13 @@ categories = ["rendering::graphics-api"]
 
 [features]
 
+# OpenGL is the default backend. On Apple platforms this feature controls
+# whether the OpenGL backend is available; other platforms always require it.
+default = ["opengl"]
+opengl = []
+# Enable the Metal backend on Apple platforms.
+metal = []
+
 # Optional log-rs like macros implementation
 # disabled by default
 log-impl = []

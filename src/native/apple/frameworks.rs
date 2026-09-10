@@ -233,6 +233,7 @@ pub const kCGBitmapByteOrderDefault: u32 = 0 << 12;
 pub const kCGImageAlphaLast: u32 = 3;
 pub const kCGRenderingIntentDefault: u32 = 0;
 
+#[cfg(feature = "metal")]
 #[link(name = "Metal", kind = "framework")]
 extern "C" {
     pub fn MTLCreateSystemDefaultDevice() -> ObjcId;

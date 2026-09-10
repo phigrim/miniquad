@@ -335,6 +335,7 @@ pub struct Buffer {
 
 #[derive(Debug)]
 struct ShaderInternal {
+    library: ObjcId,
     vertex_function: ObjcId,
     fragment_function: ObjcId,
     //uniforms: Vec<ShaderUniform>,
@@ -367,6 +368,12 @@ struct Texture {
     compressed_format: Option<CompressedTextureFormat>,
 }
 struct Textures(Vec<Texture>);
+
+unsafe fn release_objc(object: ObjcId) {
+    if !object.is_null() {
+        msg_send_![object, release];
+    }
+}
 
 impl Textures {
     fn get(&self, texture: TextureId) -> Texture {
@@ -524,18 +531,25 @@ impl RenderingBackend for MetalContext {
         buffer.size
     }
     fn delete_buffer(&mut self, buffer: BufferId) {
-        let buffer = &self.buffers[buffer.0];
+        let buffer = &mut self.buffers[buffer.0];
+        let raw = buffer.raw;
         unsafe {
-            for buffer in &buffer.raw {
-                msg_send_![*buffer, release];
+            for buffer in raw {
+                release_objc(buffer);
             }
         }
+        buffer.raw = [nil; BUFFERS_IN_ROTATION];
     }
     fn delete_texture(&mut self, texture: TextureId) {
-        let texture = self.textures.get(texture);
+        let texture = self.textures.get_mut(texture);
         unsafe {
-            msg_send_![texture.texture, release];
+            release_objc(texture.texture);
+            release_objc(texture.sampler);
+            release_objc(texture.sampler_descriptor);
         }
+        texture.texture = nil;
+        texture.sampler = nil;
+        texture.sampler_descriptor = nil;
     }
     fn apply_viewport(&mut self, _x: i32, _y: i32, _w: i32, _h: i32) {}
     fn apply_scissor_rect(&mut self, x: i32, y: i32, w: i32, h: i32) {
@@ -569,15 +583,16 @@ impl RenderingBackend for MetalContext {
             MipmapFilterMode::Linear => MTLSamplerMipFilter::Linear,
         };
 
-        texture.sampler = unsafe {
-            let sampler_descriptor = msg_send_![class!(MTLSamplerDescriptor), new];
-            msg_send_![sampler_descriptor, setMinFilter: filter];
-            msg_send_![sampler_descriptor, setMipFilter: mipmap_filter];
-            msg_send_![
+        unsafe {
+            msg_send_![texture.sampler_descriptor, setMinFilter: filter];
+            msg_send_![texture.sampler_descriptor, setMipFilter: mipmap_filter];
+            let sampler = msg_send![
                 self.device,
-                newSamplerStateWithDescriptor: sampler_descriptor
-            ]
-        };
+                newSamplerStateWithDescriptor: texture.sampler_descriptor
+            ];
+            release_objc(texture.sampler);
+            texture.sampler = sampler;
+        }
     }
     fn texture_set_mag_filter(&mut self, texture: TextureId, filter: FilterMode) {
         let texture = self.textures.get_mut(texture);
@@ -587,10 +602,15 @@ impl RenderingBackend for MetalContext {
             FilterMode::Linear => MTLSamplerMinMagFilter::Linear,
         };
 
-        texture.sampler = unsafe {
+        unsafe {
             msg_send_![texture.sampler_descriptor, setMagFilter: filter];
-            msg_send_![self.device, newSamplerStateWithDescriptor: texture.sampler_descriptor]
-        };
+            let sampler = msg_send![
+                self.device,
+                newSamplerStateWithDescriptor: texture.sampler_descriptor
+            ];
+            release_objc(texture.sampler);
+            texture.sampler = sampler;
+        }
     }
     fn texture_set_wrap(&mut self, texture: TextureId, wrap_x: TextureWrap, wrap_y: TextureWrap) {
         let texture = self.textures.get_mut(texture);
@@ -607,12 +627,17 @@ impl RenderingBackend for MetalContext {
             TextureWrap::Clamp => MTLSamplerAddressMode::ClampToEdge,
         };
 
-        texture.sampler = unsafe {
+        unsafe {
             //msg_send_![texture.sampler_descriptor, setRAddressMode: wrap];
             msg_send_![texture.sampler_descriptor, setSAddressMode: wrap_s];
             msg_send_![texture.sampler_descriptor, setTAddressMode: wrap_t];
-            msg_send_![self.device, newSamplerStateWithDescriptor: texture.sampler_descriptor]
-        };
+            let sampler = msg_send![
+                self.device,
+                newSamplerStateWithDescriptor: texture.sampler_descriptor
+            ];
+            release_objc(texture.sampler);
+            texture.sampler = sampler;
+        }
     }
     fn texture_resize(
         &mut self,
@@ -720,10 +745,11 @@ impl RenderingBackend for MetalContext {
     }
 
     fn delete_render_pass(&mut self, render_pass: RenderPass) {
-        let render_pass = &self.passes[render_pass.0];
+        let render_pass = &mut self.passes[render_pass.0];
         unsafe {
-            msg_send_![render_pass.render_pass_desc, release];
+            release_objc(render_pass.render_pass_desc);
         }
+        render_pass.render_pass_desc = nil;
     }
 
     fn render_pass_color_attachments(&self, render_pass: RenderPass) -> &[TextureId] {
@@ -760,9 +786,6 @@ impl RenderingBackend for MetalContext {
                 }
             };
 
-            unsafe {
-                msg_send_![buffer, retain];
-            }
             raw[i] = buffer;
         }
         let buffer = Buffer {
@@ -822,6 +845,7 @@ impl RenderingBackend for MetalContext {
             let fragment_function: ObjcId = msg_send![library, newFunctionWithName: apple_util::str_to_nsstring("fragmentShader")];
             assert!(!fragment_function.is_null());
             let shader = ShaderInternal {
+                library,
                 vertex_function,
                 fragment_function,
             };
@@ -894,7 +918,6 @@ impl RenderingBackend for MetalContext {
 
         let texture = unsafe {
             let sampler_descriptor = msg_send_![class!(MTLSamplerDescriptor), new];
-            msg_send_![sampler_descriptor, retain];
             let min_filter = match params.min_filter {
                 FilterMode::Nearest => MTLSamplerMinMagFilter::Nearest,
                 FilterMode::Linear => MTLSamplerMinMagFilter::Linear,
@@ -919,7 +942,6 @@ impl RenderingBackend for MetalContext {
                 newSamplerStateWithDescriptor: sampler_descriptor
             ];
             let raw_texture = msg_send_![self.device, newTextureWithDescriptor: descriptor];
-            msg_send_![raw_texture, retain];
             self.textures.0.push(Texture {
                 sampler: sampler_state,
                 texture: raw_texture,
@@ -1036,7 +1058,6 @@ impl RenderingBackend for MetalContext {
         };
         let texture = unsafe {
             let sampler_descriptor = msg_send_![class!(MTLSamplerDescriptor), new];
-            msg_send_![sampler_descriptor, retain];
             let min_filter = match params.min_filter {
                 FilterMode::Nearest => MTLSamplerMinMagFilter::Nearest,
                 FilterMode::Linear => MTLSamplerMinMagFilter::Linear,
@@ -1058,7 +1079,6 @@ impl RenderingBackend for MetalContext {
                 newSamplerStateWithDescriptor: sampler_descriptor
             ];
             let raw_texture: ObjcId = msg_send![self.device, newTextureWithDescriptor: descriptor];
-            msg_send_![raw_texture, retain];
             self.textures.0.push(Texture {
                 sampler: sampler_state,
                 texture: raw_texture,
@@ -1285,6 +1305,7 @@ impl RenderingBackend for MetalContext {
                 newRenderPipelineStateWithDescriptor: descriptor
                 error: &mut error
             ];
+            release_objc(descriptor);
             if pipeline_state.is_null() {
                 let description: ObjcId = msg_send![error, localizedDescription];
                 let string = apple_util::nsstring_to_string(description);
@@ -1323,6 +1344,7 @@ impl RenderingBackend for MetalContext {
                 self.device,
                 newDepthStencilStateWithDescriptor: depth_stencil_desc
             ];
+            release_objc(depth_stencil_desc);
 
             let pipeline = PipelineInternal {
                 pipeline_state,
@@ -1555,11 +1577,28 @@ impl RenderingBackend for MetalContext {
         }
     }
 
-    fn delete_shader(&mut self, _shader: ShaderId) {
-        // TODO: place holder
+    fn delete_shader(&mut self, shader: ShaderId) {
+        let shader = &mut self.shaders[shader.0];
+        unsafe {
+            release_objc(shader.vertex_function);
+            release_objc(shader.fragment_function);
+            release_objc(shader.library);
+        }
+        shader.vertex_function = nil;
+        shader.fragment_function = nil;
+        shader.library = nil;
     }
-    fn delete_pipeline(&mut self, _pipeline: Pipeline) {
-        // TODO: place holder
+    fn delete_pipeline(&mut self, pipeline: Pipeline) {
+        let pipeline_internal = &mut self.pipelines[pipeline.0];
+        unsafe {
+            release_objc(pipeline_internal.pipeline_state);
+            release_objc(pipeline_internal.depth_stencil_state);
+        }
+        pipeline_internal.pipeline_state = nil;
+        pipeline_internal.depth_stencil_state = nil;
+        if self.current_pipeline == Some(pipeline) {
+            self.current_pipeline = None;
+        }
     }
 
     fn commit_frame(&mut self) {

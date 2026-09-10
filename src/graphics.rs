@@ -10,12 +10,12 @@ mod gl;
 
 pub use gl::raw_gl;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "metal"))]
 mod metal;
 
 pub use gl::GlContext;
 
-#[cfg(target_vendor = "apple")]
+#[cfg(all(target_vendor = "apple", feature = "metal"))]
 pub use metal::MetalContext;
 
 #[derive(Clone, Copy, Debug)]
