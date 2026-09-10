@@ -15,10 +15,7 @@ use {
     std::{
         collections::HashMap,
         os::raw::c_void,
-        sync::{
-            Condvar, Mutex,
-            mpsc::Receiver,
-        },
+        sync::{mpsc::Receiver, Condvar, Mutex},
         time::{Duration, Instant},
     },
 };
@@ -279,8 +276,13 @@ impl MacosDisplay {
                 self.ime_position = (x, y);
                 unsafe {
                     let input_context: ObjcId = msg_send![self.view, inputContext];
-                    let current_context: ObjcId = msg_send![class!(NSTextInputContext), currentInputContext];
-                    let ctx = if input_context != nil { input_context } else { current_context };
+                    let current_context: ObjcId =
+                        msg_send![class!(NSTextInputContext), currentInputContext];
+                    let ctx = if input_context != nil {
+                        input_context
+                    } else {
+                        current_context
+                    };
                     if ctx != nil {
                         let _: () = msg_send![ctx, invalidateCharacterCoordinates];
                     }
@@ -293,8 +295,13 @@ impl MacosDisplay {
                         let _: () = msg_send![self.window, makeFirstResponder: self.view];
                     }
                     let input_context: ObjcId = msg_send![self.view, inputContext];
-                    let current_context: ObjcId = msg_send![class!(NSTextInputContext), currentInputContext];
-                    let ctx = if input_context != nil { input_context } else { current_context };
+                    let current_context: ObjcId =
+                        msg_send![class!(NSTextInputContext), currentInputContext];
+                    let ctx = if input_context != nil {
+                        input_context
+                    } else {
+                        current_context
+                    };
                     if ctx != nil {
                         if enabled {
                             let _: () = msg_send![ctx, activate];
@@ -826,9 +833,20 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
             };
             let length: u64 = msg_send![ns_str, length];
             if !actual_range.is_null() {
-                let actual_loc = if range.location <= length { range.location } else { 0 };
-                let actual_len = if actual_loc + range.length <= length { range.length } else { length.saturating_sub(actual_loc) };
-                *(actual_range as *mut NSRange) = NSRange { location: actual_loc, length: actual_len };
+                let actual_loc = if range.location <= length {
+                    range.location
+                } else {
+                    0
+                };
+                let actual_len = if actual_loc + range.length <= length {
+                    range.length
+                } else {
+                    length.saturating_sub(actual_loc)
+                };
+                *(actual_range as *mut NSRange) = NSRange {
+                    location: actual_loc,
+                    length: actual_len,
+                };
             }
             let attr_str: ObjcId = msg_send![class!(NSAttributedString), alloc];
             let attr_str: ObjcId = msg_send![attr_str, initWithString: ns_str];
@@ -1161,10 +1179,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
         sel!(setMarkedText:selectedRange:replacementRange:),
         set_marked_text as extern "C" fn(&Object, Sel, ObjcId, NSRange, NSRange),
     );
-    decl.add_method(
-        sel!(unmarkText),
-        unmark_text as extern "C" fn(&Object, Sel),
-    );
+    decl.add_method(sel!(unmarkText), unmark_text as extern "C" fn(&Object, Sel));
     decl.add_method(
         sel!(insertText:replacementRange:),
         insert_text as extern "C" fn(&Object, Sel, ObjcId, NSRange),
@@ -1185,8 +1200,7 @@ unsafe fn view_base_decl(decl: &mut ClassDecl) {
     );
     decl.add_method(
         sel!(firstRectForCharacterRange:),
-        first_rect_for_character_range_single
-            as extern "C" fn(&Object, Sel, NSRange) -> NSRect,
+        first_rect_for_character_range_single as extern "C" fn(&Object, Sel, NSRange) -> NSRect,
     );
 }
 
@@ -1479,7 +1493,11 @@ impl FramePacer {
             return;
         }
 
-        let (mut frame_ready, _) = self.frame_signal.cond.wait_timeout(frame_ready, timeout).unwrap();
+        let (mut frame_ready, _) = self
+            .frame_signal
+            .cond
+            .wait_timeout(frame_ready, timeout)
+            .unwrap();
 
         if *frame_ready {
             *frame_ready = false;
@@ -1577,11 +1595,7 @@ unsafe fn initialize_menu_bar(ns_app: ObjcId) {
     msg_send_![app_menu, addItem: quit_item];
 }
 
-unsafe fn perform_redraw(
-    display: &mut MacosDisplay,
-    gfx_api: GfxApi,
-    _in_draw_rect: bool,
-) {
+unsafe fn perform_redraw(display: &mut MacosDisplay, gfx_api: GfxApi, _in_draw_rect: bool) {
     if display.event_handler.is_none() {
         let f = display.f.take().unwrap();
         display.event_handler = Some(f());
@@ -1622,6 +1636,8 @@ unsafe fn perform_redraw(
             }
         }
         match gfx_api {
+            #[cfg(feature = "wgpu")]
+            GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
             #[cfg(feature = "opengl")]
             GfxApi::OpenGl => {
                 msg_send_!(display.gl_context, flushBuffer);
@@ -1726,6 +1742,8 @@ where
     let () = msg_send![window, setTitle: title];
 
     let view = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "wgpu")]
+        GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
         #[cfg(feature = "opengl")]
         GfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
         #[cfg(feature = "metal")]
@@ -1780,6 +1798,8 @@ where
     // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
     let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
     let timer = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "wgpu")]
+        GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
         #[cfg(feature = "opengl")]
         GfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
                                                            target:view
@@ -1805,7 +1825,6 @@ where
     };
     let mut done = false;
     while !(done || crate::native_display().lock().unwrap().quit_ordered) {
-
         // Wait at the top for just in time rendering
         if let Some(frame_pacer) = frame_pacer.as_ref() {
             frame_pacer.wait_next_frame(Duration::from_millis(50));
@@ -1846,6 +1865,5 @@ where
         if !conf.platform.blocking_event_loop || display.update_requested {
             perform_redraw(&mut display, conf.platform.prefer_gfx_api, false);
         }
-
     }
 }

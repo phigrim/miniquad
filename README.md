@@ -183,3 +183,9 @@ cargo run --example quad --target x86_64-pc-windows-gnu
 Miniquad is supported by:
 
 [SourceGear](https://www.sourcegear.com/)
+
+## Optional wgpu backend
+
+The `wgpu` feature adds a desktop renderer alongside OpenGL and Metal.
+See [WGPU.md](WGPU.md) for shader conventions, local release checks and current
+platform/API limitations.

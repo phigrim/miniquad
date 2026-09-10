@@ -1,7 +1,7 @@
 #![allow(non_upper_case_globals, non_snake_case)]
 
 use super::{
-    libx11::{self, Display, Window, _XPrivDisplay},
+    libx11::{self, _XPrivDisplay, Display, Window},
     xi_input,
 };
 

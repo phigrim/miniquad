@@ -1197,7 +1197,11 @@ impl RenderingBackend for GlContext {
     ) -> Result<ShaderId, ShaderError> {
         let (fragment, vertex) = match shader {
             ShaderSource::Glsl { fragment, vertex } => (fragment, vertex),
-            _ => panic!("Metal source on OpenGl context"),
+            _ => {
+                return Err(ShaderError::LinkError(
+                    "OpenGL requires GLSL shader sources".into(),
+                ))
+            }
         };
         let shader = load_shader_internal(vertex, fragment, meta)?;
         Ok(ShaderId(self.shaders.add(shader)))

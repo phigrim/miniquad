@@ -16,9 +16,12 @@ pub mod native;
 #[cfg(all(
     target_vendor = "apple",
     not(feature = "opengl"),
-    not(feature = "metal")
+    not(feature = "metal"),
+    not(feature = "wgpu")
 ))]
-compile_error!("miniquad requires at least one Apple graphics backend feature: `opengl` or `metal`");
+compile_error!(
+    "miniquad requires at least one Apple graphics backend feature: `opengl` or `metal`"
+);
 use std::collections::HashMap;
 use std::ops::{Index, IndexMut};
 
@@ -67,6 +70,10 @@ impl<T> ResourceManager<T> {
     pub fn remove(&mut self, id: usize) -> T {
         // Let it crash if the resource is not found
         self.resources.remove(&id).unwrap()
+    }
+
+    pub(crate) fn get(&self, id: usize) -> Option<&T> {
+        self.resources.get(&id)
     }
 }
 
@@ -137,13 +144,17 @@ pub mod window {
 
     /// Creates the rendering backend selected by the native platform.
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
+        #[cfg(feature = "wgpu")]
+        if let Some(context) = native::wgpu_window::take_context() {
+            return Box::new(context);
+        }
         #[cfg(target_vendor = "apple")]
         {
             match window::gfx_api() {
+                #[cfg(feature = "wgpu")]
+                conf::GfxApi::Wgpu => panic!("wgpu rendering context already taken"),
                 #[cfg(feature = "metal")]
-                conf::GfxApi::Metal => {
-                    Box::new(MetalContext::new())
-                }
+                conf::GfxApi::Metal => Box::new(MetalContext::new()),
                 #[cfg(feature = "opengl")]
                 conf::GfxApi::OpenGl => Box::new(GlContext::new()),
             }
@@ -430,7 +441,8 @@ pub mod window {
 
         #[cfg(not(target_os = "android"))]
         {
-            let _ = d.native_requests
+            let _ = d
+                .native_requests
                 .send(native::Request::UpdateTextInputState {
                     text,
                     selection_start,
@@ -472,7 +484,7 @@ pub mod window {
     pub fn set_ime_enabled(enabled: bool) {
         let mut d = native_display().lock().unwrap();
         d.ime_enabled = enabled;
-        
+
         #[cfg(target_os = "android")]
         {
             let _ = enabled; // IME control not applicable on Android
@@ -485,7 +497,7 @@ pub mod window {
                 .unwrap();
         }
     }
-    
+
     pub fn is_ime_enabled() -> bool {
         let d = native_display().lock().unwrap();
         d.ime_enabled
@@ -524,6 +536,12 @@ pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
+    #[cfg(feature = "wgpu")]
+    if conf.platform.prefer_gfx_api == conf::GfxApi::Wgpu {
+        native::wgpu_window::run(conf, f);
+        return;
+    }
+
     #[cfg(target_env = "ohos")]
     unsafe {
         native::ohos::run(conf, f);

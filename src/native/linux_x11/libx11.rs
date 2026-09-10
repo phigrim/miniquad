@@ -799,7 +799,7 @@ pub mod Xresource_h {
         pub size: libc::c_uint,
         pub addr: XPointer,
     }
-    use super::Xlib_h::{XPointer, _XrmHashBucketRec};
+    use super::Xlib_h::{_XrmHashBucketRec, XPointer};
 }
 
 #[derive(Copy, Clone)]
@@ -851,7 +851,8 @@ pub struct XIMStyles {
 #[derive(Copy, Clone)]
 pub struct XIMCallback {
     pub client_data: *mut libc::c_void,
-    pub callback: Option<unsafe extern "C" fn(XIC, *mut libc::c_void, *mut libc::c_void) -> libc::c_int>,
+    pub callback:
+        Option<unsafe extern "C" fn(XIC, *mut libc::c_void, *mut libc::c_void) -> libc::c_int>,
 }
 
 #[repr(C)]

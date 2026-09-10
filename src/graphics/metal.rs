@@ -824,7 +824,11 @@ impl RenderingBackend for MetalContext {
         unsafe {
             let program = match shader {
                 ShaderSource::Msl { program } => program,
-                _ => panic!("OpenGl source on Metal context"),
+                _ => {
+                    return Err(ShaderError::LinkError(
+                        "Metal requires MSL shader sources".into(),
+                    ))
+                }
             };
             let shader = apple_util::str_to_nsstring(program);
             let mut error: ObjcId = nil;

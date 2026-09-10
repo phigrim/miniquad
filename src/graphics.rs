@@ -8,6 +8,11 @@ use std::{error::Error, fmt::Display};
 
 mod gl;
 
+#[cfg(feature = "wgpu")]
+mod wgpu;
+#[cfg(feature = "wgpu")]
+pub use self::wgpu::WgpuContext;
+
 pub use gl::raw_gl;
 
 #[cfg(all(target_vendor = "apple", feature = "metal"))]
@@ -1455,8 +1460,18 @@ impl<'a> UniformsSource<'a> {
 
 #[derive(Debug)]
 pub enum ShaderSource<'a> {
-    Glsl { vertex: &'a str, fragment: &'a str },
-    Msl { program: &'a str },
+    Glsl {
+        vertex: &'a str,
+        fragment: &'a str,
+    },
+    Msl {
+        program: &'a str,
+    },
+    /// Native WGSL: `vs_main` / `fs_main`; group 0 binding 0 is the uniform
+    /// block, followed by texture/sampler pairs in `ShaderMeta::images` order.
+    Wgsl {
+        program: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
@@ -1480,6 +1495,8 @@ pub struct GlslSupport {
 
 #[derive(PartialEq, Clone, Copy, Debug)]
 pub enum Backend {
+    #[cfg(feature = "wgpu")]
+    Wgpu,
     Metal,
     OpenGl,
 }
@@ -1505,6 +1522,8 @@ impl ContextInfo {
     pub fn has_integer_attributes(&self) -> bool {
         match self.backend {
             Backend::Metal => true,
+            #[cfg(feature = "wgpu")]
+            Backend::Wgpu => true,
             Backend::OpenGl => {
                 self.glsl_support.v150 | self.glsl_support.v300es | self.glsl_support.v330
             }

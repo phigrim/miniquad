@@ -177,7 +177,7 @@ pub trait EventHandler {
     fn mouse_button_down_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {}
     fn mouse_button_up_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {}
     fn mouse_leave_event(&mut self) {}
-    fn mouse_enter_event(&mut self, _button: MouseButton ,_x: f32, _y: f32 ) {}
+    fn mouse_enter_event(&mut self, _button: MouseButton, _x: f32, _y: f32) {}
 
     fn char_event(&mut self, _character: char, _keymods: KeyMods, _repeat: bool) {}
 
@@ -236,7 +236,7 @@ pub trait EventHandler {
 
     /// Get IME preedit text and the cursor position in UTF-16 code units.
     fn on_ime_preedit(&mut self, _text: &str, _cursor_pos: usize) {}
-    
+
     /// Called when IME composition is committed with final text
     fn on_ime_commit(&mut self, _text: Option<&str>) {}
 
@@ -249,5 +249,6 @@ pub trait EventHandler {
         _composing_start: Option<usize>,
         _composing_end: Option<usize>,
         _element_id: u64,
-    ) {}
+    ) {
+    }
 }

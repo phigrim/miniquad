@@ -23,10 +23,17 @@ default = ["opengl"]
 opengl = []
 # Enable the Metal backend on Apple platforms.
 metal = []
-
-# Optional log-rs like macros implementation
-# disabled by default
 log-impl = []
+# Portable desktop renderer; native OpenGL/Metal stay dependency-free.
+wgpu = ["dep:wgpu", "dep:naga", "dep:pollster", "dep:winit", "dep:arboard"]
+
+[dependencies]
+wgpu = { version = "29.0.4", optional = true, default-features = false, features = ["std", "metal", "vulkan", "dx12", "wgsl", "naga-ir"] }
+naga = { version = "29.0.4", optional = true, features = ["glsl-in", "wgsl-in"] }
+pollster = { version = "0.4", optional = true }
+arboard = { version = "3.6.1", optional = true, default-features = false }
+winit = { version = "0.30.13", optional = true }
+
 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"

@@ -81,25 +81,47 @@ pub enum GfxApi {
     /// Use OpenGL.
     #[cfg(any(not(target_vendor = "apple"), feature = "opengl"))]
     OpenGl,
+    /// Use the portable wgpu renderer.
+    #[cfg(feature = "wgpu")]
+    Wgpu,
     /// Use Metal on Apple platforms.
     #[cfg(all(target_vendor = "apple", feature = "metal"))]
     Metal,
 }
 
 impl Default for GfxApi {
-    #[cfg(any(not(target_vendor = "apple"), feature = "opengl"))]
     fn default() -> Self {
-        Self::OpenGl
-    }
-
-    #[cfg(all(target_vendor = "apple", not(feature = "opengl"), feature = "metal"))]
-    fn default() -> Self {
-        Self::Metal
-    }
-
-    #[cfg(all(target_vendor = "apple", not(feature = "opengl"), not(feature = "metal")))]
-    fn default() -> Self {
-        unreachable!("an Apple graphics backend feature must be enabled")
+        #[cfg(feature = "opengl")]
+        {
+            return Self::OpenGl;
+        }
+        #[cfg(all(not(feature = "opengl"), target_vendor = "apple", feature = "metal"))]
+        {
+            return Self::Metal;
+        }
+        #[cfg(all(
+            not(feature = "opengl"),
+            not(all(target_vendor = "apple", feature = "metal")),
+            feature = "wgpu"
+        ))]
+        {
+            return Self::Wgpu;
+        }
+        #[cfg(all(
+            not(feature = "opengl"),
+            not(feature = "wgpu"),
+            not(target_vendor = "apple")
+        ))]
+        {
+            return Self::OpenGl;
+        }
+        #[cfg(all(
+            target_vendor = "apple",
+            not(feature = "opengl"),
+            not(feature = "metal"),
+            not(feature = "wgpu")
+        ))]
+        unreachable!("a graphics backend feature must be enabled")
     }
 }
 

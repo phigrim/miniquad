@@ -111,7 +111,10 @@ unsafe extern "C" fn preedit_draw_callback(
                     text_struct.string.wide_char,
                     text_struct.length as usize,
                 );
-                wslice.iter().map(|&wc| char::from_u32(wc as u32).unwrap_or('?')).collect::<String>()
+                wslice
+                    .iter()
+                    .map(|&wc| char::from_u32(wc as u32).unwrap_or('?'))
+                    .collect::<String>()
             } else {
                 let bslice = std::slice::from_raw_parts(
                     text_struct.string.multi_byte as *const u8,
@@ -281,7 +284,10 @@ impl X11Display {
         );
         if !res.is_null() {
             let err = std::ffi::CStr::from_ptr(res).to_string_lossy();
-            eprintln!("WARNING: XGetICValues(XNFilterEvents) failed, returned attribute: {}", err);
+            eprintln!(
+                "WARNING: XGetICValues(XNFilterEvents) failed, returned attribute: {}",
+                err
+            );
         }
 
         let base_mask: libc::c_long = KeyPressMask
@@ -449,8 +455,7 @@ impl X11Display {
                     _ if (state & Button3MotionMask) != 0 => MouseButton::Right,
                     _ => MouseButton::Unknown,
                 };
-                event_handler.mouse_enter_event( btn , x, y);
-
+                event_handler.mouse_enter_event(btn, x, y);
             }
             8 => {
                 event_handler.mouse_leave_event();
@@ -764,7 +769,8 @@ impl X11Display {
                             if !preedit_attr.is_null() {
                                 let ret = (self.libx11.XSetICValues)(
                                     self.xic,
-                                    libx11::XNPreeditAttributes.as_ptr() as *const core::ffi::c_char,
+                                    libx11::XNPreeditAttributes.as_ptr()
+                                        as *const core::ffi::c_char,
                                     preedit_attr,
                                     std::ptr::null::<core::ffi::c_void>(),
                                 );

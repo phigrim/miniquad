@@ -285,7 +285,7 @@ impl IosDisplay {
                 if !is_same_text {
                     msg_send_![self.textfield, setText: ns_text];
                 }
-                
+
                 let beginning: ObjcId = msg_send![self.textfield, beginningOfDocument];
                 if !beginning.is_null() {
                     let start_pos: ObjcId = msg_send![self.textfield, positionFromPosition: beginning offset: selection_start as i64];
@@ -293,7 +293,8 @@ impl IosDisplay {
                     if !start_pos.is_null() && !end_pos.is_null() {
                         let range: ObjcId = msg_send![self.textfield, textRangeFromPosition: start_pos toPosition: end_pos];
                         if !range.is_null() {
-                            let current_range: ObjcId = msg_send![self.textfield, selectedTextRange];
+                            let current_range: ObjcId =
+                                msg_send![self.textfield, selectedTextRange];
                             let is_same_range: BOOL = if !current_range.is_null() {
                                 msg_send![current_range, isEqual: range]
                             } else {
@@ -444,10 +445,14 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
     let mut decl = ClassDecl::new("QuadViewDlg", superclass).unwrap();
 
     extern "C" fn draw_in_rect(this: &Object, _: Sel, _: ObjcId, _: ObjcId) {
-        static DRAW_ENTER_COUNT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        static DRAW_ENTER_COUNT: std::sync::atomic::AtomicU64 =
+            std::sync::atomic::AtomicU64::new(0);
         let draw_count = DRAW_ENTER_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         if draw_count == 0 || draw_count == 60 || draw_count % 300 == 0 {
-            log(&format!("[miniquad] draw_in_rect entered (call count: {})", draw_count));
+            log(&format!(
+                "[miniquad] draw_in_rect entered (call count: {})",
+                draw_count
+            ));
         }
 
         let payload = get_window_payload(this);
@@ -473,8 +478,7 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         // Measure the view, not the device screen — iOS-on-Mac
         // windowed mode has view < UIScreen.
         let view_bounds: NSRect = unsafe { msg_send![payload.view, bounds] };
-        let content_scale_factor: f64 =
-            unsafe { msg_send![payload.view, contentScaleFactor] };
+        let content_scale_factor: f64 = unsafe { msg_send![payload.view, contentScaleFactor] };
         let screen_width = (view_bounds.size.width * content_scale_factor) as i32;
         let screen_height = (view_bounds.size.height * content_scale_factor) as i32;
         let dpi_scale = content_scale_factor as f32;
@@ -521,8 +525,7 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
         let height = size.height as i32;
         let changed = {
             let mut display = native_display().lock().unwrap();
-            let changed =
-                display.screen_width != width || display.screen_height != height;
+            let changed = display.screen_width != width || display.screen_height != height;
             if changed {
                 display.screen_width = width;
                 display.screen_height = height;
@@ -560,6 +563,8 @@ pub fn define_glk_or_mtk_view_dlg(superclass: &Class) -> *const Class {
 
         unsafe {
             match payload.gfx_api {
+                #[cfg(feature = "wgpu")]
+                GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
                 #[cfg(feature = "metal")]
                 GfxApi::Metal => {
                     let _: () = msg_send![payload.view, draw];
@@ -888,14 +893,12 @@ pub fn define_app_delegate() -> *const Class {
             let screen_height = (screen_rect.size.height * scale) as i32;
 
             let view = match conf.platform.prefer_gfx_api {
+                #[cfg(feature = "wgpu")]
+                GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
                 #[cfg(feature = "opengl")]
-                GfxApi::OpenGl => {
-                    create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi)
-                }
+                GfxApi::OpenGl => create_opengl_view(screen_rect, conf.sample_count, conf.high_dpi),
                 #[cfg(feature = "metal")]
-                GfxApi::Metal => {
-                    create_metal_view(screen_rect, conf.sample_count, conf.high_dpi)
-                }
+                GfxApi::Metal => create_metal_view(screen_rect, conf.sample_count, conf.high_dpi),
             };
 
             let (textfield_dlg, textfield) = {
@@ -907,7 +910,7 @@ pub fn define_app_delegate() -> *const Class {
                 msg_send_![textview, setAutocapitalizationType: 0]; // UITextAutocapitalizationTypeNone
                 msg_send_![textview, setAutocorrectionType: 2]; // UITextAutocorrectionTypeYes / Default
                 msg_send_![textview, setSpellCheckingType: 2]; // UITextSpellCheckingTypeYes / Default
-                
+
                 let font: ObjcId = msg_send![class!(UIFont), systemFontOfSize: 16.0f64];
                 if !font.is_null() {
                     let _: () = msg_send![textview, setFont: font];
@@ -933,9 +936,11 @@ pub fn define_app_delegate() -> *const Class {
                 let notification_center = msg_send_![class!(NSNotificationCenter), defaultCenter];
                 let will_show = apple_util::str_to_nsstring("UIKeyboardWillShowNotification");
                 let will_hide = apple_util::str_to_nsstring("UIKeyboardWillHideNotification");
-                let will_change = apple_util::str_to_nsstring("UIKeyboardWillChangeFrameNotification");
+                let will_change =
+                    apple_util::str_to_nsstring("UIKeyboardWillChangeFrameNotification");
                 let did_show = apple_util::str_to_nsstring("UIKeyboardDidShowNotification");
-                let did_change = apple_util::str_to_nsstring("UIKeyboardDidChangeFrameNotification");
+                let did_change =
+                    apple_util::str_to_nsstring("UIKeyboardDidChangeFrameNotification");
 
                 msg_send_![notification_center, addObserver:textview_dlg
                            selector:sel!(keyboardWasShown:)
@@ -952,11 +957,13 @@ pub fn define_app_delegate() -> *const Class {
                 msg_send_![notification_center, addObserver:textview_dlg
                            selector:sel!(keyboardDidChangeFrame:)
                            name:did_change object:nil];
-                let text_did_change_name = apple_util::str_to_nsstring("UITextViewTextDidChangeNotification");
+                let text_did_change_name =
+                    apple_util::str_to_nsstring("UITextViewTextDidChangeNotification");
                 msg_send_![notification_center, addObserver:textview_dlg
                            selector:sel!(textViewDidChangeNotification:)
                            name:text_did_change_name object:textview];
-                let selection_did_change_name = apple_util::str_to_nsstring("UITextViewTextDidChangeSelectionNotification");
+                let selection_did_change_name =
+                    apple_util::str_to_nsstring("UITextViewTextDidChangeSelectionNotification");
                 msg_send_![notification_center, addObserver:textview_dlg
                            selector:sel!(textViewDidChangeSelectionNotification:)
                            name:selection_did_change_name object:textview];
@@ -1113,8 +1120,10 @@ fn sync_textview_state(this: &Object, textview: ObjcId) {
             let beginning: ObjcId = msg_send![textview, beginningOfDocument];
             let start_pos: ObjcId = msg_send![marked_range, start];
             let end_pos: ObjcId = msg_send![marked_range, end];
-            let start_offset: i64 = msg_send![textview, offsetFromPosition: beginning toPosition: start_pos];
-            let end_offset: i64 = msg_send![textview, offsetFromPosition: beginning toPosition: end_pos];
+            let start_offset: i64 =
+                msg_send![textview, offsetFromPosition: beginning toPosition: start_pos];
+            let end_offset: i64 =
+                msg_send![textview, offsetFromPosition: beginning toPosition: end_pos];
 
             let ns_preedit: ObjcId = msg_send![textview, textInRange: marked_range];
             let preedit = if !ns_preedit.is_null() {
@@ -1123,8 +1132,16 @@ fn sync_textview_state(this: &Object, textview: ObjcId) {
                 String::new()
             };
 
-            let cs = if start_offset >= 0 { start_offset as usize } else { 0 };
-            let ce = if end_offset >= 0 { end_offset as usize } else { cs };
+            let cs = if start_offset >= 0 {
+                start_offset as usize
+            } else {
+                0
+            };
+            let ce = if end_offset >= 0 {
+                end_offset as usize
+            } else {
+                cs
+            };
             (Some(cs), Some(ce), preedit)
         } else {
             (None, None, String::new())
@@ -1135,10 +1152,20 @@ fn sync_textview_state(this: &Object, textview: ObjcId) {
             let beginning: ObjcId = msg_send![textview, beginningOfDocument];
             let start_pos: ObjcId = msg_send![selected_range, start];
             let end_pos: ObjcId = msg_send![selected_range, end];
-            let start_offset: i64 = msg_send![textview, offsetFromPosition: beginning toPosition: start_pos];
-            let end_offset: i64 = msg_send![textview, offsetFromPosition: beginning toPosition: end_pos];
-            let s_start = if start_offset >= 0 { start_offset as usize } else { 0 };
-            let s_end = if end_offset >= 0 { end_offset as usize } else { s_start };
+            let start_offset: i64 =
+                msg_send![textview, offsetFromPosition: beginning toPosition: start_pos];
+            let end_offset: i64 =
+                msg_send![textview, offsetFromPosition: beginning toPosition: end_pos];
+            let s_start = if start_offset >= 0 {
+                start_offset as usize
+            } else {
+                0
+            };
+            let s_end = if end_offset >= 0 {
+                end_offset as usize
+            } else {
+                s_start
+            };
             (s_start, s_end)
         } else {
             let u16_len = text.encode_utf16().count();
@@ -1242,9 +1269,11 @@ fn define_textview_dlg() -> *const Class {
                     let payload = &mut *(ptr as *mut IosDisplay);
                     if payload.current_element_id != 0 {
                         let point: NSPoint = msg_send![recognizer, locationInView: payload.view];
-                        let menu: ObjcId = msg_send![class!(UIMenuController), sharedMenuController];
+                        let menu: ObjcId =
+                            msg_send![class!(UIMenuController), sharedMenuController];
                         let target_rect = NSRect::new(point.x, point.y, 1.0, 1.0);
-                        let _: () = msg_send![menu, setTargetRect: target_rect inView: payload.view];
+                        let _: () =
+                            msg_send![menu, setTargetRect: target_rect inView: payload.view];
                         let _: () = msg_send![menu, setMenuVisible: YES animated: YES];
                     }
                 }
