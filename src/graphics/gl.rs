@@ -69,6 +69,7 @@ impl TextureOrRenderbuffer {
 struct Texture {
     raw: TextureOrRenderbuffer,
     params: TextureParams,
+    compressed_format: Option<CompressedTextureFormat>,
 }
 
 impl TextureFormat {
@@ -111,6 +112,191 @@ impl From<TextureKind> for GLuint {
             TextureKind::CubeMap => GL_TEXTURE_CUBE_MAP,
         }
     }
+}
+
+fn compressed_gl_internal_format(format: CompressedTextureFormat) -> Option<GLenum> {
+    Some(match format {
+        CompressedTextureFormat::Bc1Rgb => GL_COMPRESSED_RGB_S3TC_DXT1_EXT,
+        CompressedTextureFormat::Bc1Rgba => GL_COMPRESSED_RGBA_S3TC_DXT1_EXT,
+        CompressedTextureFormat::Bc2 => GL_COMPRESSED_RGBA_S3TC_DXT3_EXT,
+        CompressedTextureFormat::Bc3 => GL_COMPRESSED_RGBA_S3TC_DXT5_EXT,
+        CompressedTextureFormat::Bc4 => GL_COMPRESSED_RED_RGTC1,
+        CompressedTextureFormat::Bc5 => GL_COMPRESSED_RG_RGTC2,
+        CompressedTextureFormat::Bc6hUnsigned => GL_COMPRESSED_RGB_BPTC_UNSIGNED_FLOAT,
+        CompressedTextureFormat::Bc6hSigned => GL_COMPRESSED_RGB_BPTC_SIGNED_FLOAT,
+        CompressedTextureFormat::Bc7 => GL_COMPRESSED_RGBA_BPTC_UNORM,
+        CompressedTextureFormat::Etc2Rgb8 => GL_COMPRESSED_RGB8_ETC2,
+        CompressedTextureFormat::Etc2Rgb8A1 => GL_COMPRESSED_RGB8_PUNCHTHROUGH_ALPHA1_ETC2,
+        CompressedTextureFormat::Etc2Rgba8 => GL_COMPRESSED_RGBA8_ETC2_EAC,
+        CompressedTextureFormat::EacR11 => GL_COMPRESSED_R11_EAC,
+        CompressedTextureFormat::EacRg11 => GL_COMPRESSED_RG11_EAC,
+        CompressedTextureFormat::Astc {
+            block_width: 4,
+            block_height: 4,
+        } => GL_COMPRESSED_RGBA_ASTC_4X4_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 5,
+            block_height: 4,
+        } => GL_COMPRESSED_RGBA_ASTC_5X4_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 5,
+            block_height: 5,
+        } => GL_COMPRESSED_RGBA_ASTC_5X5_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 6,
+            block_height: 5,
+        } => GL_COMPRESSED_RGBA_ASTC_6X5_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 6,
+            block_height: 6,
+        } => GL_COMPRESSED_RGBA_ASTC_6X6_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 5,
+        } => GL_COMPRESSED_RGBA_ASTC_8X5_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 6,
+        } => GL_COMPRESSED_RGBA_ASTC_8X6_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 8,
+        } => GL_COMPRESSED_RGBA_ASTC_8X8_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 5,
+        } => GL_COMPRESSED_RGBA_ASTC_10X5_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 6,
+        } => GL_COMPRESSED_RGBA_ASTC_10X6_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 8,
+        } => GL_COMPRESSED_RGBA_ASTC_10X8_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 10,
+        } => GL_COMPRESSED_RGBA_ASTC_10X10_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 12,
+            block_height: 10,
+        } => GL_COMPRESSED_RGBA_ASTC_12X10_KHR,
+        CompressedTextureFormat::Astc {
+            block_width: 12,
+            block_height: 12,
+        } => GL_COMPRESSED_RGBA_ASTC_12X12_KHR,
+        CompressedTextureFormat::PvrtcRgb2 => GL_COMPRESSED_RGB_PVRTC_2BPPV1_IMG,
+        CompressedTextureFormat::PvrtcRgb4 => GL_COMPRESSED_RGB_PVRTC_4BPPV1_IMG,
+        CompressedTextureFormat::PvrtcRgba2 => GL_COMPRESSED_RGBA_PVRTC_2BPPV1_IMG,
+        CompressedTextureFormat::PvrtcRgba4 => GL_COMPRESSED_RGBA_PVRTC_4BPPV1_IMG,
+        CompressedTextureFormat::Astc { .. } => return None,
+    })
+}
+
+fn has_gl_extension(extensions: &str, extension: &str) -> bool {
+    extensions.split_whitespace().any(|item| item == extension)
+}
+
+unsafe fn gl_extensions() -> String {
+    let extensions = glGetString(GL_EXTENSIONS);
+    if !extensions.is_null() {
+        return std::ffi::CStr::from_ptr(extensions as _)
+            .to_string_lossy()
+            .into_owned();
+    }
+
+    let mut count = 0;
+    glGetIntegerv(GL_NUM_EXTENSIONS, &mut count);
+    let mut names = Vec::new();
+    for index in 0..count.max(0) as u32 {
+        let extension = glGetStringi(GL_EXTENSIONS, index);
+        if !extension.is_null() {
+            names.push(
+                std::ffi::CStr::from_ptr(extension as _)
+                    .to_string_lossy()
+                    .into_owned(),
+            );
+        }
+    }
+    names.join(" ")
+}
+
+fn compressed_texture_support() -> CompressedTextureSupport {
+    let extensions = unsafe { gl_extensions() };
+    let version = unsafe { glGetString(GL_VERSION) };
+    let version = if version.is_null() {
+        String::new()
+    } else {
+        unsafe { std::ffi::CStr::from_ptr(version as _) }
+            .to_string_lossy()
+            .into_owned()
+    };
+    let gles3 = version.contains("OpenGL ES 3") || version.contains("OpenGL ES 3.");
+    let webgl_etc = has_gl_extension(&extensions, "WEBGL_compressed_texture_etc");
+    let s3tc = has_gl_extension(&extensions, "GL_EXT_texture_compression_s3tc")
+        || has_gl_extension(&extensions, "WEBGL_compressed_texture_s3tc");
+    let rgtc = has_gl_extension(&extensions, "GL_EXT_texture_compression_rgtc")
+        || has_gl_extension(&extensions, "GL_ARB_texture_compression_rgtc");
+    let bptc = has_gl_extension(&extensions, "GL_ARB_texture_compression_bptc");
+    let etc2 = gles3
+        || webgl_etc
+        || has_gl_extension(&extensions, "GL_ARB_ES3_compatibility")
+        || has_gl_extension(&extensions, "OES_compressed_ETC2_RGB8_texture")
+        || version.starts_with("4.3")
+        || version.starts_with("4.4")
+        || version.starts_with("4.5")
+        || version.starts_with("4.6");
+    let astc = has_gl_extension(&extensions, "GL_KHR_texture_compression_astc_ldr")
+        || has_gl_extension(&extensions, "WEBGL_compressed_texture_astc");
+    let pvrtc = has_gl_extension(&extensions, "GL_IMG_texture_compression_pvrtc")
+        || has_gl_extension(&extensions, "WEBGL_compressed_texture_pvrtc");
+
+    let mut support = CompressedTextureSupport::empty();
+    if s3tc {
+        support.enable_all(&[
+            CompressedTextureFormat::Bc1Rgb,
+            CompressedTextureFormat::Bc1Rgba,
+            CompressedTextureFormat::Bc2,
+            CompressedTextureFormat::Bc3,
+        ]);
+    }
+    if rgtc {
+        support.enable_all(&[CompressedTextureFormat::Bc4, CompressedTextureFormat::Bc5]);
+    }
+    if bptc {
+        support.enable_all(&[
+            CompressedTextureFormat::Bc6hUnsigned,
+            CompressedTextureFormat::Bc6hSigned,
+            CompressedTextureFormat::Bc7,
+        ]);
+    }
+    if etc2 {
+        support.enable_all(&[
+            CompressedTextureFormat::Etc2Rgb8,
+            CompressedTextureFormat::Etc2Rgb8A1,
+            CompressedTextureFormat::Etc2Rgba8,
+            CompressedTextureFormat::EacR11,
+            CompressedTextureFormat::EacRg11,
+        ]);
+    }
+    if astc {
+        for &(block_width, block_height) in &CompressedTextureFormat::ASTC_BLOCKS {
+            support.enable(CompressedTextureFormat::Astc {
+                block_width,
+                block_height,
+            });
+        }
+    }
+    if pvrtc {
+        support.enable_all(&[
+            CompressedTextureFormat::PvrtcRgb2,
+            CompressedTextureFormat::PvrtcRgb4,
+            CompressedTextureFormat::PvrtcRgba2,
+            CompressedTextureFormat::PvrtcRgba4,
+        ]);
+    }
+    support
 }
 impl From<Equation> for GLenum {
     fn from(eq: Equation) -> Self {
@@ -208,6 +394,7 @@ impl Texture {
             return Texture {
                 raw: TextureOrRenderbuffer::Renderbuffer(renderbuffer),
                 params,
+                compressed_format: None,
             };
         }
 
@@ -319,10 +506,115 @@ impl Texture {
         Texture {
             raw: TextureOrRenderbuffer::Texture(texture),
             params,
+            compressed_format: None,
+        }
+    }
+
+    pub fn new_compressed(
+        ctx: &mut GlContext,
+        access: TextureAccess,
+        source: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> Texture {
+        validate_compressed_texture(access, &source, &params)
+            .unwrap_or_else(|error| panic!("{}", error));
+        let internal_format = compressed_gl_internal_format(params.format)
+            .expect("invalid compressed texture format");
+        let allocate_mipmaps = match &source {
+            CompressedTextureSource::Mipmaps(levels) => levels.len() > 1,
+            CompressedTextureSource::CubeMap(faces) => {
+                faces.first().map_or(false, |levels| levels.len() > 1)
+            }
+        };
+
+        ctx.cache.store_texture_binding(0);
+        let mut texture = 0;
+        unsafe {
+            glGenTextures(1, &mut texture as *mut _);
+            ctx.cache.bind_texture(0, params.kind.into(), texture);
+            glPixelStorei(GL_UNPACK_ALIGNMENT, 1);
+
+            let upload = |target: GLenum, level: usize, width: u32, height: u32, bytes: &[u8]| {
+                glCompressedTexImage2D(
+                    target,
+                    level as i32,
+                    internal_format,
+                    width as i32,
+                    height as i32,
+                    0,
+                    bytes.len() as i32,
+                    bytes.as_ptr() as *const _,
+                );
+            };
+
+            match source {
+                CompressedTextureSource::Mipmaps(levels) => {
+                    for (level, bytes) in levels.iter().enumerate() {
+                        upload(
+                            GL_TEXTURE_2D,
+                            level,
+                            (params.width >> level).max(1),
+                            (params.height >> level).max(1),
+                            bytes,
+                        );
+                    }
+                }
+                CompressedTextureSource::CubeMap(faces) => {
+                    for (face, levels) in faces.iter().enumerate() {
+                        for (level, bytes) in levels.iter().enumerate() {
+                            upload(
+                                GL_TEXTURE_CUBE_MAP_POSITIVE_X + face as u32,
+                                level,
+                                (params.width >> level).max(1),
+                                (params.height >> level).max(1),
+                                bytes,
+                            );
+                        }
+                    }
+                }
+            }
+
+            let wrap = match params.wrap {
+                TextureWrap::Repeat => GL_REPEAT,
+                TextureWrap::Mirror => GL_MIRRORED_REPEAT,
+                TextureWrap::Clamp => GL_CLAMP_TO_EDGE,
+            };
+            let min_filter = Self::gl_filter(params.min_filter, params.mipmap_filter);
+            let mag_filter = match params.mag_filter {
+                FilterMode::Nearest => GL_NEAREST,
+                FilterMode::Linear => GL_LINEAR,
+            };
+            let target = params.kind.into();
+            glTexParameteri(target, GL_TEXTURE_WRAP_S, wrap as i32);
+            glTexParameteri(target, GL_TEXTURE_WRAP_T, wrap as i32);
+            glTexParameteri(target, GL_TEXTURE_MIN_FILTER, min_filter as i32);
+            glTexParameteri(target, GL_TEXTURE_MAG_FILTER, mag_filter as i32);
+        }
+        ctx.cache.restore_texture_binding(0);
+
+        Texture {
+            raw: TextureOrRenderbuffer::Texture(texture),
+            params: TextureParams {
+                kind: params.kind,
+                format: TextureFormat::RGBA8,
+                wrap: params.wrap,
+                min_filter: params.min_filter,
+                mag_filter: params.mag_filter,
+                mipmap_filter: params.mipmap_filter,
+                width: params.width,
+                height: params.height,
+                allocate_mipmaps,
+                sample_count: 1,
+            },
+            compressed_format: Some(params.format),
         }
     }
 
     pub fn resize(&mut self, ctx: &mut GlContext, width: u32, height: u32, source: Option<&[u8]>) {
+        assert!(
+            self.compressed_format.is_none(),
+            "texture_resize is not supported for compressed textures"
+        );
         let raw = self
             .raw
             .texture()
@@ -364,6 +656,10 @@ impl Texture {
         height: i32,
         source: &[u8],
     ) {
+        assert!(
+            self.compressed_format.is_none(),
+            "texture_update_part is not supported for compressed textures"
+        );
         assert_eq!(self.size(width as _, height as _), source.len());
         assert!(x_offset + width <= self.params.width as _);
         assert!(y_offset + height <= self.params.height as _);
@@ -503,6 +799,7 @@ impl Textures {
             TextureIdInner::Raw(RawId::OpenGl(texture)) => Texture {
                 raw: TextureOrRenderbuffer::Texture(texture),
                 params: Default::default(),
+                compressed_format: None,
             },
             #[cfg(target_vendor = "apple")]
             TextureIdInner::Raw(RawId::Metal(..)) => panic!("Metal texture in OpenGL context!"),
@@ -519,6 +816,7 @@ pub struct GlContext {
     default_framebuffer: GLuint,
     pub(crate) cache: GlCache,
     pub(crate) info: ContextInfo,
+    compressed_texture_support: CompressedTextureSupport,
 }
 
 impl Default for GlContext {
@@ -540,6 +838,7 @@ impl GlContext {
             glGenVertexArrays(1, &mut vao as *mut _);
             glBindVertexArray(vao);
             let info = gl_info();
+            let compressed_texture_support = compressed_texture_support();
             GlContext {
                 default_framebuffer,
                 shaders: ResourceManager::default(),
@@ -548,6 +847,7 @@ impl GlContext {
                 buffers: ResourceManager::default(),
                 textures: Textures(vec![]),
                 info,
+                compressed_texture_support,
                 cache: GlCache {
                     stored_index_buffer: 0,
                     stored_index_type: None,
@@ -886,6 +1186,10 @@ impl RenderingBackend for GlContext {
         self.info.clone()
     }
 
+    fn compressed_texture_support(&self) -> CompressedTextureSupport {
+        self.compressed_texture_support
+    }
+
     fn new_shader(
         &mut self,
         shader: ShaderSource,
@@ -906,6 +1210,17 @@ impl RenderingBackend for GlContext {
         params: TextureParams,
     ) -> TextureId {
         let texture = Texture::new(self, access, source, params);
+        self.textures.0.push(texture);
+        TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
+    }
+
+    fn new_compressed_texture(
+        &mut self,
+        access: TextureAccess,
+        source: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> TextureId {
+        let texture = Texture::new_compressed(self, access, source, params);
         self.textures.0.push(texture);
         TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
     }
@@ -1009,6 +1324,10 @@ impl RenderingBackend for GlContext {
         source: Option<&[u8]>,
     ) {
         let mut t = self.textures.get(texture);
+        assert!(
+            t.compressed_format.is_none(),
+            "texture_resize is not supported for compressed textures"
+        );
         t.resize(self, width, height, source);
         if let TextureIdInner::Managed(tex_id) = texture.0 {
             self.textures.0[tex_id].params = t.params;
@@ -1016,10 +1335,18 @@ impl RenderingBackend for GlContext {
     }
     fn texture_read_pixels(&mut self, texture: TextureId, source: &mut [u8]) {
         let t = self.textures.get(texture);
+        assert!(
+            t.compressed_format.is_none(),
+            "texture_read_pixels is not supported for compressed textures"
+        );
         t.read_pixels(source);
     }
     fn texture_generate_mipmaps(&mut self, texture: TextureId) {
         let t = self.textures.get(texture);
+        assert!(
+            t.compressed_format.is_none(),
+            "texture_generate_mipmaps is not supported for compressed textures"
+        );
         let raw = t.raw.texture().expect(
             "texture_generate_mipmaps not yet implemented for RenderBuffer(multisampled) textures",
         );
@@ -1041,6 +1368,10 @@ impl RenderingBackend for GlContext {
         source: &[u8],
     ) {
         let t = self.textures.get(texture);
+        assert!(
+            t.compressed_format.is_none(),
+            "texture_update_part is not supported for compressed textures"
+        );
         t.update_texture_part(self, x_offset, y_offset, width, height, source);
     }
     fn texture_params(&self, texture: TextureId) -> TextureParams {

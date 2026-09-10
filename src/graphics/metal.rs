@@ -167,6 +167,129 @@ impl From<TextureFormat> for MTLPixelFormat {
     }
 }
 
+fn compressed_metal_pixel_format(format: CompressedTextureFormat) -> Option<MTLPixelFormat> {
+    Some(match format {
+        CompressedTextureFormat::Bc1Rgb | CompressedTextureFormat::Bc1Rgba => {
+            MTLPixelFormat::BC1_RGBA
+        }
+        CompressedTextureFormat::Bc2 => MTLPixelFormat::BC2_RGBA,
+        CompressedTextureFormat::Bc3 => MTLPixelFormat::BC3_RGBA,
+        CompressedTextureFormat::Bc4 => MTLPixelFormat::BC4_RUnorm,
+        CompressedTextureFormat::Bc5 => MTLPixelFormat::BC5_RGUnorm,
+        CompressedTextureFormat::Bc6hUnsigned => MTLPixelFormat::BC6H_RGBUFloat,
+        CompressedTextureFormat::Bc6hSigned => MTLPixelFormat::BC6H_RGBFloat,
+        CompressedTextureFormat::Bc7 => MTLPixelFormat::BC7_RGBAUnorm,
+        CompressedTextureFormat::Etc2Rgb8 => MTLPixelFormat::ETC2_RGB8,
+        CompressedTextureFormat::Etc2Rgb8A1 => MTLPixelFormat::ETC2_RGB8A1,
+        CompressedTextureFormat::Etc2Rgba8 => MTLPixelFormat::ETC2_RGBA8,
+        CompressedTextureFormat::EacR11 => MTLPixelFormat::EAC_R11Unorm,
+        CompressedTextureFormat::EacRg11 => MTLPixelFormat::EAC_RG11Unorm,
+        CompressedTextureFormat::Astc {
+            block_width: 4,
+            block_height: 4,
+        } => MTLPixelFormat::ASTC_4x4_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 5,
+            block_height: 4,
+        } => MTLPixelFormat::ASTC_5x4_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 5,
+            block_height: 5,
+        } => MTLPixelFormat::ASTC_5x5_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 6,
+            block_height: 5,
+        } => MTLPixelFormat::ASTC_6x5_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 6,
+            block_height: 6,
+        } => MTLPixelFormat::ASTC_6x6_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 5,
+        } => MTLPixelFormat::ASTC_8x5_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 6,
+        } => MTLPixelFormat::ASTC_8x6_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 8,
+            block_height: 8,
+        } => MTLPixelFormat::ASTC_8x8_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 5,
+        } => MTLPixelFormat::ASTC_10x5_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 6,
+        } => MTLPixelFormat::ASTC_10x6_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 8,
+        } => MTLPixelFormat::ASTC_10x8_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 10,
+            block_height: 10,
+        } => MTLPixelFormat::ASTC_10x10_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 12,
+            block_height: 10,
+        } => MTLPixelFormat::ASTC_12x10_LDR,
+        CompressedTextureFormat::Astc {
+            block_width: 12,
+            block_height: 12,
+        } => MTLPixelFormat::ASTC_12x12_LDR,
+        CompressedTextureFormat::PvrtcRgb2 => MTLPixelFormat::PVRTC_RGB_2BPP,
+        CompressedTextureFormat::PvrtcRgb4 => MTLPixelFormat::PVRTC_RGB_4BPP,
+        CompressedTextureFormat::PvrtcRgba2 => MTLPixelFormat::PVRTC_RGBA_2BPP,
+        CompressedTextureFormat::PvrtcRgba4 => MTLPixelFormat::PVRTC_RGBA_4BPP,
+        CompressedTextureFormat::Astc { .. } => return None,
+    })
+}
+
+fn compressed_texture_support() -> CompressedTextureSupport {
+    let mut support = CompressedTextureSupport::empty();
+    #[cfg(target_os = "macos")]
+    {
+        support.enable_all(&[
+            CompressedTextureFormat::Bc1Rgb,
+            CompressedTextureFormat::Bc1Rgba,
+            CompressedTextureFormat::Bc2,
+            CompressedTextureFormat::Bc3,
+            CompressedTextureFormat::Bc4,
+            CompressedTextureFormat::Bc5,
+            CompressedTextureFormat::Bc6hUnsigned,
+            CompressedTextureFormat::Bc6hSigned,
+            CompressedTextureFormat::Bc7,
+        ]);
+    }
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        for &(block_width, block_height) in &CompressedTextureFormat::ASTC_BLOCKS {
+            support.enable(CompressedTextureFormat::Astc {
+                block_width,
+                block_height,
+            });
+        }
+    }
+    #[cfg(target_os = "ios")]
+    {
+        support.enable_all(&[
+            CompressedTextureFormat::Etc2Rgb8,
+            CompressedTextureFormat::Etc2Rgb8A1,
+            CompressedTextureFormat::Etc2Rgba8,
+            CompressedTextureFormat::EacR11,
+            CompressedTextureFormat::EacRg11,
+            CompressedTextureFormat::PvrtcRgb2,
+            CompressedTextureFormat::PvrtcRgb4,
+            CompressedTextureFormat::PvrtcRgba2,
+            CompressedTextureFormat::PvrtcRgba4,
+        ]);
+    }
+    support
+}
+
 // impl From<CullFace> for MTLCullMode {
 //     fn from(cull_face: CullFace) -> Self {
 //         match cull_face {
@@ -241,6 +364,7 @@ struct Texture {
     sampler: ObjcId,
     sampler_descriptor: ObjcId,
     params: TextureParams,
+    compressed_format: Option<CompressedTextureFormat>,
 }
 struct Textures(Vec<Texture>);
 
@@ -279,6 +403,7 @@ pub struct MetalContext {
     // cached pipeline from apply_pipeline
     current_pipeline: Option<Pipeline>,
     current_ub_offset: u64,
+    compressed_texture_support: CompressedTextureSupport,
 }
 
 impl Default for MetalContext {
@@ -373,6 +498,7 @@ impl MetalContext {
                 uniform_buffers,
                 current_frame_index: 1,
                 current_ub_offset: 0,
+                compressed_texture_support: compressed_texture_support(),
             }
         }
     }
@@ -389,6 +515,9 @@ impl RenderingBackend for MetalContext {
                 resolve_attachments: false,
             },
         }
+    }
+    fn compressed_texture_support(&self) -> CompressedTextureSupport {
+        self.compressed_texture_support
     }
     fn buffer_size(&mut self, buffer: BufferId) -> usize {
         let buffer = &self.buffers[buffer.0];
@@ -487,17 +616,29 @@ impl RenderingBackend for MetalContext {
     }
     fn texture_resize(
         &mut self,
-        _texture: TextureId,
+        texture: TextureId,
         _width: u32,
         _height: u32,
         _bytes: Option<&[u8]>,
     ) {
+        assert!(
+            self.textures.get(texture).compressed_format.is_none(),
+            "texture_resize is not supported for compressed textures"
+        );
         unimplemented!()
     }
-    fn texture_read_pixels(&mut self, _texture: TextureId, _bytes: &mut [u8]) {
+    fn texture_read_pixels(&mut self, texture: TextureId, _bytes: &mut [u8]) {
+        assert!(
+            self.textures.get(texture).compressed_format.is_none(),
+            "texture_read_pixels is not supported for compressed textures"
+        );
         unimplemented!()
     }
     fn texture_generate_mipmaps(&mut self, texture: TextureId) {
+        assert!(
+            self.textures.get(texture).compressed_format.is_none(),
+            "texture_generate_mipmaps is not supported for compressed textures"
+        );
         unsafe {
             if self.command_buffer.is_none() {
                 self.command_buffer = Some(msg_send![self.command_queue, commandBuffer]);
@@ -784,6 +925,7 @@ impl RenderingBackend for MetalContext {
                 texture: raw_texture,
                 sampler_descriptor,
                 params,
+                compressed_format: None,
             });
             TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
         };
@@ -838,6 +980,152 @@ impl RenderingBackend for MetalContext {
         texture
     }
 
+    fn new_compressed_texture(
+        &mut self,
+        access: TextureAccess,
+        source: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> TextureId {
+        validate_compressed_texture(access, &source, &params)
+            .unwrap_or_else(|error| panic!("{}", error));
+        let pixel_format = compressed_metal_pixel_format(params.format)
+            .expect("invalid compressed texture format");
+        let mipmapped = match &source {
+            CompressedTextureSource::Mipmaps(levels) => levels.len() > 1,
+            CompressedTextureSource::CubeMap(faces) => {
+                faces.first().map_or(false, |levels| levels.len() > 1)
+            }
+        };
+        let descriptor = unsafe {
+            msg_send_![class!(MTLTextureDescriptor),
+                       texture2DDescriptorWithPixelFormat:pixel_format
+                       width:params.width as u64
+                       height:params.height as u64
+                       mipmapped:mipmapped as BOOL]
+        };
+
+        unsafe {
+            msg_send_![descriptor, setCpuCacheMode: MTLCPUCacheMode::DefaultCache];
+            msg_send_![descriptor, setUsage: MTLTextureUsage::ShaderRead];
+            #[cfg(target_os = "macos")]
+            {
+                msg_send_![descriptor, setStorageMode: MTLStorageMode::Managed];
+                msg_send_![descriptor, setResourceOptions: MTLResourceOptions::StorageModeManaged];
+            }
+            #[cfg(target_os = "ios")]
+            {
+                msg_send_![descriptor, setStorageMode: MTLStorageMode::Shared];
+                msg_send_![descriptor, setResourceOptions: MTLResourceOptions::StorageModeShared];
+            }
+            if params.kind == TextureKind::CubeMap {
+                msg_send_![descriptor, setTextureType: MTLTextureType::Cube];
+            }
+        }
+
+        let texture_params = TextureParams {
+            kind: params.kind,
+            format: TextureFormat::RGBA8,
+            wrap: params.wrap,
+            min_filter: params.min_filter,
+            mag_filter: params.mag_filter,
+            mipmap_filter: params.mipmap_filter,
+            width: params.width,
+            height: params.height,
+            allocate_mipmaps: mipmapped,
+            sample_count: 1,
+        };
+        let texture = unsafe {
+            let sampler_descriptor = msg_send_![class!(MTLSamplerDescriptor), new];
+            msg_send_![sampler_descriptor, retain];
+            let min_filter = match params.min_filter {
+                FilterMode::Nearest => MTLSamplerMinMagFilter::Nearest,
+                FilterMode::Linear => MTLSamplerMinMagFilter::Linear,
+            };
+            let mag_filter = match params.mag_filter {
+                FilterMode::Nearest => MTLSamplerMinMagFilter::Nearest,
+                FilterMode::Linear => MTLSamplerMinMagFilter::Linear,
+            };
+            let mipmap_filter = match params.mipmap_filter {
+                MipmapFilterMode::None => MTLSamplerMipFilter::NotMipmapped,
+                MipmapFilterMode::Nearest => MTLSamplerMipFilter::Nearest,
+                MipmapFilterMode::Linear => MTLSamplerMipFilter::Linear,
+            };
+            msg_send_![sampler_descriptor, setMinFilter: min_filter];
+            msg_send_![sampler_descriptor, setMagFilter: mag_filter];
+            msg_send_![sampler_descriptor, setMipFilter: mipmap_filter];
+            let sampler_state = msg_send![
+                self.device,
+                newSamplerStateWithDescriptor: sampler_descriptor
+            ];
+            let raw_texture: ObjcId = msg_send![self.device, newTextureWithDescriptor: descriptor];
+            msg_send_![raw_texture, retain];
+            self.textures.0.push(Texture {
+                sampler: sampler_state,
+                texture: raw_texture,
+                sampler_descriptor,
+                params: texture_params,
+                compressed_format: Some(params.format),
+            });
+            TextureId(TextureIdInner::Managed(self.textures.0.len() - 1))
+        };
+
+        let raw_texture = self.textures.get(texture).texture;
+        let upload = |slice: usize, level: usize, width: u32, height: u32, bytes: &[u8]| {
+            let (block_width, block_height) = params.format.block_extent();
+            let blocks_x = width.div_ceil(block_width);
+            let blocks_y = height.div_ceil(block_height);
+            let bytes_per_row = if params.format.is_pvrtc() {
+                bytes.len()
+            } else {
+                (blocks_x * params.format.bytes_per_block()) as usize
+            };
+            let region = MTLRegion {
+                origin: MTLOrigin { x: 0, y: 0, z: 0 },
+                size: MTLSize {
+                    width: width as u64,
+                    height: height as u64,
+                    depth: 1,
+                },
+            };
+            unsafe {
+                msg_send_![raw_texture, replaceRegion:region
+                              mipmapLevel:level
+                              slice:slice
+                              withBytes:bytes.as_ptr()
+                              bytesPerRow:bytes_per_row as u64
+                              bytesPerImage:(bytes_per_row * blocks_y as usize) as u64
+                ];
+            }
+        };
+        match source {
+            CompressedTextureSource::Mipmaps(levels) => {
+                for (level, bytes) in levels.iter().enumerate() {
+                    upload(
+                        0,
+                        level,
+                        (params.width >> level).max(1),
+                        (params.height >> level).max(1),
+                        bytes,
+                    );
+                }
+            }
+            CompressedTextureSource::CubeMap(faces) => {
+                for (face, levels) in faces.iter().enumerate() {
+                    for (level, bytes) in levels.iter().enumerate() {
+                        upload(
+                            face,
+                            level,
+                            (params.width >> level).max(1),
+                            (params.height >> level).max(1),
+                            bytes,
+                        );
+                    }
+                }
+            }
+        }
+        texture
+    }
+
     fn texture_update_part(
         &mut self,
         texture: TextureId,
@@ -847,7 +1135,12 @@ impl RenderingBackend for MetalContext {
         height: i32,
         bytes: &[u8],
     ) {
-        let raw_texture = self.textures.get(texture).texture;
+        let texture_info = self.textures.get(texture);
+        assert!(
+            texture_info.compressed_format.is_none(),
+            "texture_update_part is not supported for compressed textures"
+        );
+        let raw_texture = texture_info.texture;
         let region = MTLRegion {
             origin: MTLOrigin {
                 x: x_offset as u64,

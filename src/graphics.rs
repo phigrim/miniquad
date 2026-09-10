@@ -341,6 +341,421 @@ impl TextureFormat {
     }
 }
 
+/// GPU-native block-compressed texture formats.
+///
+/// These formats describe the data consumed by the rendering backend. They do
+/// not describe a file/container format such as KTX2 or DDS.
+#[derive(Debug, PartialEq, Eq, Clone, Copy, Hash)]
+pub enum CompressedTextureFormat {
+    Bc1Rgb,
+    Bc1Rgba,
+    Bc2,
+    Bc3,
+    Bc4,
+    Bc5,
+    Bc6hUnsigned,
+    Bc6hSigned,
+    Bc7,
+    Etc2Rgb8,
+    Etc2Rgb8A1,
+    Etc2Rgba8,
+    EacR11,
+    EacRg11,
+    Astc { block_width: u8, block_height: u8 },
+    PvrtcRgb2,
+    PvrtcRgb4,
+    PvrtcRgba2,
+    PvrtcRgba4,
+}
+
+impl CompressedTextureFormat {
+    const ASTC_BLOCKS: [(u8, u8); 14] = [
+        (4, 4),
+        (5, 4),
+        (5, 5),
+        (6, 5),
+        (6, 6),
+        (8, 5),
+        (8, 6),
+        (8, 8),
+        (10, 5),
+        (10, 6),
+        (10, 8),
+        (10, 10),
+        (12, 10),
+        (12, 12),
+    ];
+
+    pub const fn is_astc(self) -> bool {
+        matches!(self, Self::Astc { .. })
+    }
+
+    pub const fn is_pvrtc(self) -> bool {
+        matches!(
+            self,
+            Self::PvrtcRgb2 | Self::PvrtcRgb4 | Self::PvrtcRgba2 | Self::PvrtcRgba4
+        )
+    }
+
+    pub const fn is_valid(self) -> bool {
+        match self {
+            Self::Astc {
+                block_width,
+                block_height,
+            } => Self::valid_astc_block(block_width, block_height),
+            _ => true,
+        }
+    }
+
+    pub const fn valid_astc_block(block_width: u8, block_height: u8) -> bool {
+        let mut index = 0;
+        while index < Self::ASTC_BLOCKS.len() {
+            let (width, height) = Self::ASTC_BLOCKS[index];
+            if width == block_width && height == block_height {
+                return true;
+            }
+            index += 1;
+        }
+        false
+    }
+
+    pub const fn block_extent(self) -> (u32, u32) {
+        match self {
+            Self::Bc1Rgb
+            | Self::Bc1Rgba
+            | Self::Bc2
+            | Self::Bc3
+            | Self::Bc4
+            | Self::Bc5
+            | Self::Bc6hUnsigned
+            | Self::Bc6hSigned
+            | Self::Bc7
+            | Self::Etc2Rgb8
+            | Self::Etc2Rgb8A1
+            | Self::Etc2Rgba8
+            | Self::EacR11
+            | Self::EacRg11 => (4, 4),
+            Self::Astc {
+                block_width,
+                block_height,
+            } => (block_width as u32, block_height as u32),
+            Self::PvrtcRgb2 | Self::PvrtcRgba2 | Self::PvrtcRgb4 | Self::PvrtcRgba4 => (1, 1),
+        }
+    }
+
+    pub const fn bytes_per_block(self) -> u32 {
+        match self {
+            Self::Bc1Rgb
+            | Self::Bc1Rgba
+            | Self::Bc4
+            | Self::Etc2Rgb8
+            | Self::Etc2Rgb8A1
+            | Self::EacR11 => 8,
+            Self::Bc2
+            | Self::Bc3
+            | Self::Bc5
+            | Self::Bc6hUnsigned
+            | Self::Bc6hSigned
+            | Self::Bc7
+            | Self::Etc2Rgba8
+            | Self::EacRg11
+            | Self::Astc { .. } => 16,
+            Self::PvrtcRgb2 | Self::PvrtcRgba2 | Self::PvrtcRgb4 | Self::PvrtcRgba4 => 0,
+        }
+    }
+
+    /// Returns the encoded byte size of one mip level.
+    pub fn level_size(self, width: u32, height: u32) -> Option<usize> {
+        if width == 0 || height == 0 || !self.is_valid() {
+            return None;
+        }
+        if self.is_pvrtc() {
+            let bits_per_pixel = match self {
+                Self::PvrtcRgb2 | Self::PvrtcRgba2 => 2,
+                _ => 4,
+            };
+            let bits = u64::from(width) * u64::from(height) * bits_per_pixel;
+            return Some(((bits + 7) / 8).max(32) as usize);
+        }
+        let (block_width, block_height) = self.block_extent();
+        let blocks_x = width.div_ceil(block_width);
+        let blocks_y = height.div_ceil(block_height);
+        Some(
+            (u64::from(blocks_x) * u64::from(blocks_y) * u64::from(self.bytes_per_block()))
+                as usize,
+        )
+    }
+
+    pub(crate) const fn support_bit(self) -> u128 {
+        match self {
+            Self::Bc1Rgb => 1 << 0,
+            Self::Bc1Rgba => 1 << 1,
+            Self::Bc2 => 1 << 2,
+            Self::Bc3 => 1 << 3,
+            Self::Bc4 => 1 << 4,
+            Self::Bc5 => 1 << 5,
+            Self::Bc6hUnsigned => 1 << 6,
+            Self::Bc6hSigned => 1 << 7,
+            Self::Bc7 => 1 << 8,
+            Self::Etc2Rgb8 => 1 << 9,
+            Self::Etc2Rgb8A1 => 1 << 10,
+            Self::Etc2Rgba8 => 1 << 11,
+            Self::EacR11 => 1 << 12,
+            Self::EacRg11 => 1 << 13,
+            Self::Astc {
+                block_width,
+                block_height,
+            } => {
+                let mut index = 0;
+                while index < Self::ASTC_BLOCKS.len() {
+                    if Self::ASTC_BLOCKS[index].0 == block_width
+                        && Self::ASTC_BLOCKS[index].1 == block_height
+                    {
+                        return 1 << (14 + index);
+                    }
+                    index += 1;
+                }
+                0
+            }
+            Self::PvrtcRgb2 => 1 << 28,
+            Self::PvrtcRgb4 => 1 << 29,
+            Self::PvrtcRgba2 => 1 << 30,
+            Self::PvrtcRgba4 => 1 << 31,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct CompressedTextureSupport {
+    bits: u128,
+}
+
+impl CompressedTextureSupport {
+    pub const fn empty() -> Self {
+        Self { bits: 0 }
+    }
+
+    pub fn supports(self, format: CompressedTextureFormat) -> bool {
+        let bit = format.support_bit();
+        bit != 0 && self.bits & bit != 0
+    }
+
+    pub(crate) fn enable(&mut self, format: CompressedTextureFormat) {
+        self.bits |= format.support_bit();
+    }
+
+    pub(crate) fn enable_all(&mut self, formats: &[CompressedTextureFormat]) {
+        for format in formats {
+            self.enable(*format);
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct CompressedTextureParams {
+    pub kind: TextureKind,
+    pub format: CompressedTextureFormat,
+    pub wrap: TextureWrap,
+    pub min_filter: FilterMode,
+    pub mag_filter: FilterMode,
+    pub mipmap_filter: MipmapFilterMode,
+    pub width: u32,
+    pub height: u32,
+}
+
+impl Default for CompressedTextureParams {
+    fn default() -> Self {
+        Self {
+            kind: TextureKind::Texture2D,
+            format: CompressedTextureFormat::Bc1Rgba,
+            wrap: TextureWrap::Clamp,
+            min_filter: FilterMode::Linear,
+            mag_filter: FilterMode::Linear,
+            mipmap_filter: MipmapFilterMode::None,
+            width: 0,
+            height: 0,
+        }
+    }
+}
+
+pub enum CompressedTextureSource<'a> {
+    Mipmaps(&'a [&'a [u8]]),
+    CubeMap(&'a [&'a [&'a [u8]]]),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TextureError {
+    UnsupportedFormat(CompressedTextureFormat),
+    InvalidFormat(CompressedTextureFormat),
+    InvalidDimensions,
+    InvalidSource,
+    InvalidDataSize {
+        level: usize,
+        expected: usize,
+        actual: usize,
+    },
+    UnsupportedAccess,
+}
+
+impl std::fmt::Display for TextureError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnsupportedFormat(format) => write!(
+                formatter,
+                "compressed texture format {format:?} is not supported by this backend"
+            ),
+            Self::InvalidFormat(format) => {
+                write!(formatter, "invalid compressed texture format {format:?}")
+            }
+            Self::InvalidDimensions => {
+                formatter.write_str("compressed texture dimensions must be non-zero")
+            }
+            Self::InvalidSource => formatter
+                .write_str("compressed texture source does not match texture kind or mip layout"),
+            Self::InvalidDataSize {
+                level,
+                expected,
+                actual,
+            } => write!(
+                formatter,
+                "compressed texture mip level {level} has {actual} bytes, expected {expected}"
+            ),
+            Self::UnsupportedAccess => {
+                formatter.write_str("compressed textures are only supported as static textures")
+            }
+        }
+    }
+}
+
+impl Error for TextureError {}
+
+fn validate_compressed_texture(
+    access: TextureAccess,
+    source: &CompressedTextureSource<'_>,
+    params: &CompressedTextureParams,
+) -> Result<(), TextureError> {
+    if access != TextureAccess::Static {
+        return Err(TextureError::UnsupportedAccess);
+    }
+    if params.width == 0 || params.height == 0 {
+        return Err(TextureError::InvalidDimensions);
+    }
+    if !params.format.is_valid() {
+        return Err(TextureError::InvalidFormat(params.format));
+    }
+
+    let validate_levels = |levels: &[&[u8]]| {
+        if levels.is_empty() {
+            return Err(TextureError::InvalidSource);
+        }
+        for (level, bytes) in levels.iter().enumerate() {
+            let width = (params.width >> level).max(1);
+            let height = (params.height >> level).max(1);
+            let expected = params
+                .format
+                .level_size(width, height)
+                .ok_or(TextureError::InvalidFormat(params.format))?;
+            if bytes.len() != expected {
+                return Err(TextureError::InvalidDataSize {
+                    level,
+                    expected,
+                    actual: bytes.len(),
+                });
+            }
+        }
+        Ok(())
+    };
+
+    match (params.kind, source) {
+        (TextureKind::Texture2D, CompressedTextureSource::Mipmaps(levels)) => {
+            validate_levels(levels)
+        }
+        (TextureKind::CubeMap, CompressedTextureSource::CubeMap(faces)) => {
+            if faces.len() != 6 {
+                return Err(TextureError::InvalidSource);
+            }
+            for face in *faces {
+                validate_levels(face)?;
+            }
+            Ok(())
+        }
+        _ => Err(TextureError::InvalidSource),
+    }
+}
+
+#[cfg(test)]
+mod compressed_texture_tests {
+    use super::*;
+
+    #[test]
+    fn block_formats_report_expected_level_sizes() {
+        assert_eq!(CompressedTextureFormat::Bc1Rgba.level_size(4, 4), Some(8));
+        assert_eq!(CompressedTextureFormat::Bc3.level_size(5, 5), Some(64));
+        assert_eq!(
+            CompressedTextureFormat::Astc {
+                block_width: 6,
+                block_height: 6,
+            }
+            .level_size(7, 7),
+            Some(64)
+        );
+        assert_eq!(
+            CompressedTextureFormat::PvrtcRgba4.level_size(1, 1),
+            Some(32)
+        );
+    }
+
+    #[test]
+    fn invalid_astc_block_is_rejected() {
+        let format = CompressedTextureFormat::Astc {
+            block_width: 7,
+            block_height: 7,
+        };
+        assert!(!format.is_valid());
+        assert_eq!(format.level_size(16, 16), None);
+    }
+
+    #[test]
+    fn source_validation_checks_mip_sizes_and_cube_faces() {
+        let params = CompressedTextureParams {
+            width: 4,
+            height: 4,
+            ..Default::default()
+        };
+        let valid = [0_u8; 8];
+        assert!(validate_compressed_texture(
+            TextureAccess::Static,
+            &CompressedTextureSource::Mipmaps(&[&valid]),
+            &params,
+        )
+        .is_ok());
+        let invalid = [0_u8; 7];
+        assert!(matches!(
+            validate_compressed_texture(
+                TextureAccess::Static,
+                &CompressedTextureSource::Mipmaps(&[&invalid]),
+                &params,
+            ),
+            Err(TextureError::InvalidDataSize { .. })
+        ));
+        assert!(matches!(
+            {
+                let mip = [&valid[..]];
+                let faces = [&mip[..]; 5];
+                validate_compressed_texture(
+                    TextureAccess::Static,
+                    &CompressedTextureSource::CubeMap(&faces),
+                    &CompressedTextureParams {
+                        kind: TextureKind::CubeMap,
+                        ..params
+                    },
+                )
+            },
+            Err(TextureError::InvalidSource)
+        ));
+    }
+}
+
 /// Sets the wrap parameter for texture.
 #[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum TextureWrap {
@@ -1099,6 +1514,10 @@ impl ContextInfo {
 
 pub trait RenderingBackend {
     fn info(&self) -> ContextInfo;
+    /// Returns the compressed formats that can be sampled by this backend.
+    fn compressed_texture_support(&self) -> CompressedTextureSupport {
+        CompressedTextureSupport::empty()
+    }
     /// For metal context's ShaderSource should contain MSL source string, for GL - glsl.
     ///
     /// If in doubt, _most_ OpenGL contexts support "#version 100" glsl shaders.
@@ -1134,6 +1553,33 @@ pub trait RenderingBackend {
         data: TextureSource,
         params: TextureParams,
     ) -> TextureId;
+    /// Creates a static block-compressed texture after validating its source
+    /// and checking backend capabilities.
+    fn new_compressed_texture_checked(
+        &mut self,
+        access: TextureAccess,
+        data: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> Result<TextureId, TextureError> {
+        validate_compressed_texture(access, &data, &params)?;
+        if !self.compressed_texture_support().supports(params.format) {
+            return Err(TextureError::UnsupportedFormat(params.format));
+        }
+        Ok(self.new_compressed_texture(access, data, params))
+    }
+
+    /// Creates a static block-compressed texture.
+    ///
+    /// Prefer [`RenderingBackend::new_compressed_texture_checked`] in code
+    /// that needs to handle unsupported formats or malformed asset data.
+    fn new_compressed_texture(
+        &mut self,
+        _access: TextureAccess,
+        _data: CompressedTextureSource,
+        _params: CompressedTextureParams,
+    ) -> TextureId {
+        panic!("compressed textures are not implemented by this backend")
+    }
     fn new_render_texture(&mut self, params: TextureParams) -> TextureId {
         self.new_texture(TextureAccess::RenderTarget, TextureSource::Empty, params)
     }
