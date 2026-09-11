@@ -2,7 +2,7 @@
 use super::*;
 use crate::ResourceManager;
 use ::wgpu;
-use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, num::NonZeroU64, rc::Rc, sync::Arc};
 use wgpu::util::DeviceExt;
 mod pipeline;
 mod shader;
@@ -17,6 +17,19 @@ struct Buffer {
     element_size: usize,
     kind: BufferType,
 }
+
+struct UniformBufferArena {
+    gpu: wgpu::Buffer,
+    capacity: u64,
+    offset: u64,
+}
+
+#[derive(Hash, PartialEq, Eq)]
+struct BindGroupKey {
+    shader: usize,
+    images: Vec<TextureId>,
+}
+
 struct Pass {
     colors: Vec<TextureId>,
     resolves: Vec<TextureId>,
@@ -184,6 +197,10 @@ pub struct WgpuContext {
     current_pipeline: Option<Pipeline>,
     bindings: Option<Bindings>,
     uniforms: Vec<u8>,
+    uniform_buffer: RefCell<Option<UniformBufferArena>>,
+    bind_groups: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
+    staging_belt: RefCell<wgpu::util::StagingBelt>,
+    uniform_alignment: u64,
     viewport: Option<(f32, f32, f32, f32)>,
     scissor: Option<(u32, u32, u32, u32)>,
 }
@@ -261,6 +278,9 @@ impl WgpuContext {
             present_mode,
             framebuffer_alpha,
         }));
+        let uniform_alignment =
+            u64::from(device.limits().min_uniform_buffer_offset_alignment.max(1));
+        let staging_belt = wgpu::util::StagingBelt::new(device.clone(), 256 * 1024);
         Ok(Self {
             device,
             queue,
@@ -277,14 +297,21 @@ impl WgpuContext {
             current_pipeline: None,
             bindings: None,
             uniforms: vec![],
+            uniform_buffer: RefCell::new(None),
+            bind_groups: RefCell::new(HashMap::new()),
+            staging_belt: RefCell::new(staging_belt),
+            uniform_alignment,
             viewport: None,
             scissor: None,
         })
     }
-    fn submit(&self) {
+    fn submit(&mut self) {
+        self.staging_belt.get_mut().finish();
         if let Some(encoder) = self.encoder.borrow_mut().take() {
             self.queue.submit([encoder.finish()]);
         }
+        self.staging_belt.get_mut().recall();
+        let _ = self.device.poll(wgpu::PollType::Poll);
     }
     fn encode(&self, f: impl FnOnce(&mut wgpu::CommandEncoder)) {
         let mut encoder = self.encoder.borrow_mut();
@@ -459,6 +486,101 @@ impl WgpuContext {
             });
             f(&mut pass);
         });
+    }
+    fn allocate_uniform(&self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
+        const INITIAL_CAPACITY: u64 = 64 * 1024;
+        let binding_size = align_up(bytes.len().max(16) as u64, 16);
+        let mut arena = self.uniform_buffer.borrow_mut();
+        let offset = arena
+            .as_ref()
+            .map_or(0, |arena| align_up(arena.offset, self.uniform_alignment));
+        let required = offset + binding_size;
+        if arena.as_ref().is_none_or(|arena| required > arena.capacity) {
+            let capacity = required.max(INITIAL_CAPACITY).next_power_of_two();
+            let gpu = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("miniquad frame uniforms"),
+                size: capacity,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *arena = Some(UniformBufferArena {
+                gpu,
+                capacity,
+                offset: 0,
+            });
+            self.bind_groups.borrow_mut().clear();
+        }
+        let arena_ref = arena.as_mut().expect("uniform buffer arena initialized");
+        let offset = align_up(arena_ref.offset, self.uniform_alignment);
+        let gpu = arena_ref.gpu.clone();
+        arena_ref.offset = offset + binding_size;
+        drop(arena);
+
+        let mut encoder = self.encoder.borrow_mut();
+        let encoder = encoder.get_or_insert_with(|| {
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("miniquad frame"),
+                })
+        });
+        let mut staging_belt = self.staging_belt.borrow_mut();
+        let mut staging = staging_belt.write_buffer(
+            encoder,
+            &gpu,
+            offset,
+            NonZeroU64::new(binding_size).expect("uniform size is non-zero"),
+        );
+        if bytes.is_empty() {
+            staging.copy_from_slice(&[0; 16]);
+        } else {
+            staging.copy_from_slice(bytes);
+        }
+        drop(staging);
+        (gpu, offset, binding_size)
+    }
+
+    fn bind_group(
+        &self,
+        shader_id: usize,
+        shader: &Shader,
+        bindings: &Bindings,
+        uniform: &wgpu::Buffer,
+        uniform_size: u64,
+    ) -> wgpu::BindGroup {
+        let key = BindGroupKey {
+            shader: shader_id,
+            images: bindings.images.clone(),
+        };
+        if let Some(group) = self.bind_groups.borrow().get(&key).cloned() {
+            return group;
+        }
+
+        let mut entries = vec![wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                buffer: uniform,
+                offset: 0,
+                size: Some(NonZeroU64::new(uniform_size).expect("uniform size is non-zero")),
+            }),
+        }];
+        for (i, id) in bindings.images.iter().enumerate() {
+            let t = self.texture(*id);
+            entries.push(wgpu::BindGroupEntry {
+                binding: 1 + i as u32 * 2,
+                resource: wgpu::BindingResource::TextureView(&t.view),
+            });
+            entries.push(wgpu::BindGroupEntry {
+                binding: 2 + i as u32 * 2,
+                resource: wgpu::BindingResource::Sampler(&t.sampler),
+            });
+        }
+        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &shader.layout,
+            entries: &entries,
+        });
+        self.bind_groups.borrow_mut().insert(key, group.clone());
+        group
     }
 }
 impl RenderingBackend for WgpuContext {
@@ -656,7 +778,15 @@ impl RenderingBackend for WgpuContext {
         );
         assert!(b.kind != BufferType::IndexBuffer || element_size == b.element_size);
         b.bytes[..bytes.len()].copy_from_slice(&bytes);
-        b.gpu = make_buffer(&self.device, b.kind, b.element_size, &b.bytes);
+        // Macroquad updates its stream geometry every frame. Recreating the
+        // wgpu buffer here leaves the old Metal buffers alive until the GPU
+        // finishes with them, which creates a large transient footprint and
+        // makes the allocator retain the freed blocks. Keep the GPU buffer
+        // alive and upload the new contents in place instead.
+        if !b.bytes.is_empty() {
+            let upload = buffer_upload_bytes(b.kind, b.element_size, &b.bytes);
+            self.queue.write_buffer(&b.gpu, 0, &upload);
+        }
     }
     fn buffer_size(&mut self, id: BufferId) -> usize {
         self.buffers[id.0].bytes.len()
@@ -666,6 +796,7 @@ impl RenderingBackend for WgpuContext {
     }
     fn delete_texture(&mut self, id: TextureId) {
         if let TextureIdInner::Managed(id) = id.0 {
+            self.bind_groups.borrow_mut().clear();
             // Deletion can happen immediately after commit_frame while higher
             // layers still have a cached raw TextureId to flush. Resource ids
             // are monotonic, so retaining the old value cannot alias a new
@@ -677,6 +808,7 @@ impl RenderingBackend for WgpuContext {
         }
     }
     fn delete_shader(&mut self, id: ShaderId) {
+        self.bind_groups.borrow_mut().clear();
         self.shaders.remove(id.0);
     }
     fn apply_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {
@@ -790,6 +922,11 @@ impl RenderingBackend for WgpuContext {
             frame.present();
         }
         self.retired_textures.clear();
+        if let Some(arena) = self.uniform_buffer.borrow_mut().as_mut() {
+            // Queue writes are ordered after the previous submit, so the
+            // same backing allocation can be reused by the next frame.
+            arena.offset = 0;
+        }
     }
     fn draw(&self, base: i32, count: i32, instances: i32) {
         assert!(base >= 0 && count >= 0 && instances >= 0);
@@ -806,34 +943,9 @@ impl RenderingBackend for WgpuContext {
         let shader = &self.shaders[p.shader.0];
         let bindings = self.bindings.as_ref().expect("apply bindings before draw");
         assert_eq!(bindings.images.len(), shader.images);
-        let uniform = shader.uniforms.pack(&self.uniforms);
-        let uniform = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("miniquad draw uniforms"),
-                contents: &uniform,
-                usage: wgpu::BufferUsages::UNIFORM,
-            });
-        let mut entries = vec![wgpu::BindGroupEntry {
-            binding: 0,
-            resource: uniform.as_entire_binding(),
-        }];
-        for (i, id) in bindings.images.iter().enumerate() {
-            let t = self.texture(*id);
-            entries.push(wgpu::BindGroupEntry {
-                binding: 1 + i as u32 * 2,
-                resource: wgpu::BindingResource::TextureView(&t.view),
-            });
-            entries.push(wgpu::BindGroupEntry {
-                binding: 2 + i as u32 * 2,
-                resource: wgpu::BindingResource::Sampler(&t.sampler),
-            });
-        }
-        let group = self.device.create_bind_group(&wgpu::BindGroupDescriptor {
-            label: None,
-            layout: &shader.layout,
-            entries: &entries,
-        });
+        let packed_uniform = shader.uniforms.pack(&self.uniforms);
+        let (uniform, uniform_offset, uniform_size) = self.allocate_uniform(&packed_uniform);
+        let group = self.bind_group(p.shader.0, shader, bindings, &uniform, uniform_size);
         let target = self.target.as_ref().unwrap();
         let pipeline = p.get(&self.device, shader, &target.key);
         let vertices = p.vertex_buffers(&self.device, &self.buffers, &bindings.vertex_buffers);
@@ -841,7 +953,14 @@ impl RenderingBackend for WgpuContext {
         assert!((base as usize + count as usize) * index.element_size <= index.bytes.len());
         self.render(&PassAction::Nothing, |pass| {
             pass.set_pipeline(&pipeline);
-            pass.set_bind_group(0, &group, &[]);
+            pass.set_bind_group(
+                0,
+                &group,
+                &[{
+                    assert!(uniform_offset <= u64::from(u32::MAX));
+                    uniform_offset as u32
+                }],
+            );
             for (i, b) in vertices.iter().enumerate() {
                 pass.set_vertex_buffer(i as _, b.slice(..));
             }
@@ -866,6 +985,16 @@ impl RenderingBackend for WgpuContext {
         });
     }
 }
+
+fn align_up(value: u64, alignment: u64) -> u64 {
+    let remainder = value % alignment;
+    if remainder == 0 {
+        value
+    } else {
+        value + alignment - remainder
+    }
+}
+
 fn buffer_bytes(source: BufferSource) -> (Vec<u8>, usize) {
     match source {
         BufferSource::Empty { size, element_size } => (vec![0; size], element_size),
@@ -885,25 +1014,31 @@ fn make_buffer(
     element_size: usize,
     bytes: &[u8],
 ) -> wgpu::Buffer {
-    let converted: Vec<u8>;
-    let bytes = if kind == BufferType::IndexBuffer && element_size == 1 {
-        converted = bytes
-            .iter()
-            .flat_map(|b| (*b as u16).to_ne_bytes())
-            .collect();
-        &converted
-    } else {
-        bytes
-    };
+    let converted = buffer_upload_bytes(kind, element_size, bytes);
     device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
         label: Some("miniquad geometry"),
-        contents: if bytes.is_empty() { &[0; 4] } else { bytes },
-        usage: if kind == BufferType::IndexBuffer {
-            wgpu::BufferUsages::INDEX
+        contents: if converted.is_empty() {
+            &[0; 4]
         } else {
-            wgpu::BufferUsages::VERTEX
+            &converted
+        },
+        usage: if kind == BufferType::IndexBuffer {
+            wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST
+        } else {
+            wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST
         },
     })
+}
+
+fn buffer_upload_bytes(kind: BufferType, element_size: usize, bytes: &[u8]) -> Vec<u8> {
+    if kind == BufferType::IndexBuffer && element_size == 1 {
+        bytes
+            .iter()
+            .flat_map(|byte| (*byte as u16).to_ne_bytes())
+            .collect()
+    } else {
+        bytes.to_vec()
+    }
 }
 
 #[cfg(test)]
