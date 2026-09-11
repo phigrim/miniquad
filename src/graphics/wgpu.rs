@@ -2,7 +2,7 @@
 use super::*;
 use crate::ResourceManager;
 use ::wgpu;
-use std::{cell::RefCell, collections::HashMap, num::NonZeroU64, rc::Rc, sync::Arc};
+use std::{borrow::Cow, cell::RefCell, collections::HashMap, num::NonZeroU64, rc::Rc, sync::Arc};
 use wgpu::util::DeviceExt;
 mod pipeline;
 mod shader;
@@ -91,6 +91,10 @@ impl SurfaceController {
         let mut config = surface
             .get_default_config(&state.adapter, size.width.max(1), size.height.max(1))
             .ok_or(SurfaceInitError::Unsupported)?;
+        // Metal allocates `maximum_frame_latency + 1` drawables. The default
+        // of two therefore keeps three full-size IOSurfaces alive; Entry does
+        // not need that extra frame of latency and pays for it in footprint.
+        config.desired_maximum_frame_latency = 1;
         let capabilities = surface.get_capabilities(&state.adapter);
         config.format = capabilities
             .formats
@@ -771,6 +775,7 @@ impl RenderingBackend for WgpuContext {
     }
     fn buffer_update(&mut self, id: BufferId, data: BufferSource) {
         let (bytes, element_size) = buffer_bytes(data);
+        let device = self.device.clone();
         let b = &mut self.buffers[id.0];
         assert!(
             bytes.len() <= b.bytes.len(),
@@ -785,7 +790,20 @@ impl RenderingBackend for WgpuContext {
         // alive and upload the new contents in place instead.
         if !b.bytes.is_empty() {
             let upload = buffer_upload_bytes(b.kind, b.element_size, &b.bytes);
-            self.queue.write_buffer(&b.gpu, 0, &upload);
+            let mut encoder = self.encoder.borrow_mut();
+            let encoder = encoder.get_or_insert_with(|| {
+                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("miniquad frame"),
+                })
+            });
+            let mut staging_belt = self.staging_belt.borrow_mut();
+            let mut staging = staging_belt.write_buffer(
+                encoder,
+                &b.gpu,
+                0,
+                NonZeroU64::new(upload.len() as u64).expect("buffer upload is non-zero"),
+            );
+            staging.copy_from_slice(&upload);
         }
     }
     fn buffer_size(&mut self, id: BufferId) -> usize {
@@ -1030,14 +1048,20 @@ fn make_buffer(
     })
 }
 
-fn buffer_upload_bytes(kind: BufferType, element_size: usize, bytes: &[u8]) -> Vec<u8> {
+fn buffer_upload_bytes<'a>(
+    kind: BufferType,
+    element_size: usize,
+    bytes: &'a [u8],
+) -> Cow<'a, [u8]> {
     if kind == BufferType::IndexBuffer && element_size == 1 {
-        bytes
-            .iter()
-            .flat_map(|byte| (*byte as u16).to_ne_bytes())
-            .collect()
+        Cow::Owned(
+            bytes
+                .iter()
+                .flat_map(|byte| (*byte as u16).to_ne_bytes())
+                .collect(),
+        )
     } else {
-        bytes.to_vec()
+        Cow::Borrowed(bytes)
     }
 }
 

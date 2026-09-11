@@ -17,8 +17,13 @@ impl Texture {
         } else {
             1
         };
-        let mut usage =
-            wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::RENDER_ATTACHMENT;
+        // Static textures are sampled/uploaded only. Marking every texture as
+        // a render attachment makes Metal place ordinary UI images in the
+        // renderable resource pool and inflates its graphics footprint.
+        let mut usage = wgpu::TextureUsages::TEXTURE_BINDING;
+        if access == TextureAccess::RenderTarget {
+            usage |= wgpu::TextureUsages::RENDER_ATTACHMENT;
+        }
         if samples == 1 {
             usage |= wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST;
         }
