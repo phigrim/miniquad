@@ -892,7 +892,7 @@ pub fn define_app_delegate() -> *const Class {
             let screen_width = (screen_rect.size.width * scale) as i32;
             let screen_height = (screen_rect.size.height * scale) as i32;
 
-            let view = match conf.platform.prefer_gfx_api {
+            let view: View = match conf.platform.prefer_gfx_api {
                 #[cfg(feature = "wgpu")]
                 GfxApi::Wgpu => unreachable!("wgpu uses its own window driver"),
                 #[cfg(feature = "opengl")]

@@ -9,7 +9,7 @@ use std::{error::Error, fmt::Display};
 mod gl;
 
 #[cfg(feature = "wgpu")]
-mod wgpu;
+pub(crate) mod wgpu;
 #[cfg(feature = "wgpu")]
 pub use self::wgpu::WgpuContext;
 
@@ -593,6 +593,12 @@ pub enum TextureError {
     UnsupportedFormat(CompressedTextureFormat),
     InvalidFormat(CompressedTextureFormat),
     InvalidDimensions,
+    /// The format is available, but this backend cannot represent these dimensions.
+    UnsupportedDimensions {
+        format: CompressedTextureFormat,
+        width: u32,
+        height: u32,
+    },
     InvalidSource,
     InvalidDataSize {
         level: usize,
@@ -615,6 +621,14 @@ impl std::fmt::Display for TextureError {
             Self::InvalidDimensions => {
                 formatter.write_str("compressed texture dimensions must be non-zero")
             }
+            Self::UnsupportedDimensions {
+                format,
+                width,
+                height,
+            } => write!(
+                formatter,
+                "compressed texture dimensions {width}x{height} are not supported for {format:?} by this backend"
+            ),
             Self::InvalidSource => formatter
                 .write_str("compressed texture source does not match texture kind or mip layout"),
             Self::InvalidDataSize {
@@ -1584,7 +1598,17 @@ pub trait RenderingBackend {
         if !self.compressed_texture_support().supports(params.format) {
             return Err(TextureError::UnsupportedFormat(params.format));
         }
+        self.validate_compressed_texture_params(&params)?;
         Ok(self.new_compressed_texture(access, data, params))
+    }
+
+    /// Validates backend-specific compressed texture restrictions after generic
+    /// source validation and capability checks.
+    fn validate_compressed_texture_params(
+        &self,
+        _params: &CompressedTextureParams,
+    ) -> Result<(), TextureError> {
+        Ok(())
     }
 
     /// Creates a static block-compressed texture.

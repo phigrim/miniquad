@@ -88,6 +88,49 @@ fn packed_uniforms_are_relocated_without_reading_padding() {
     assert_eq!(&packed[64..128], &data[24..88]);
     assert_eq!(&packed[4..16], &[0; 12]);
 }
+
+#[test]
+fn compression_capabilities_follow_enabled_wgpu_features() {
+    let bc = compressed_texture_support(wgpu::Features::TEXTURE_COMPRESSION_BC);
+    assert!(bc.supports(CompressedTextureFormat::Bc1Rgb));
+    assert!(bc.supports(CompressedTextureFormat::Bc7));
+    assert!(!bc.supports(CompressedTextureFormat::Etc2Rgba8));
+
+    let etc2 = compressed_texture_support(wgpu::Features::TEXTURE_COMPRESSION_ETC2);
+    assert!(etc2.supports(CompressedTextureFormat::Etc2Rgba8));
+    assert!(etc2.supports(CompressedTextureFormat::EacRg11));
+    assert!(!etc2.supports(CompressedTextureFormat::Bc7));
+
+    let astc = compressed_texture_support(wgpu::Features::TEXTURE_COMPRESSION_ASTC);
+    assert!(astc.supports(CompressedTextureFormat::Astc {
+        block_width: 6,
+        block_height: 6,
+    }));
+    assert!(!astc.supports(CompressedTextureFormat::PvrtcRgba4));
+}
+
+#[test]
+fn compressed_format_mapping_covers_wgpu_families_only() {
+    assert_eq!(
+        texture::compressed_format(CompressedTextureFormat::Bc7),
+        Some(wgpu::TextureFormat::Bc7RgbaUnorm)
+    );
+    assert_eq!(
+        texture::compressed_format(CompressedTextureFormat::Etc2Rgba8),
+        Some(wgpu::TextureFormat::Etc2Rgba8Unorm)
+    );
+    assert!(matches!(
+        texture::compressed_format(CompressedTextureFormat::Astc {
+            block_width: 6,
+            block_height: 6,
+        }),
+        Some(wgpu::TextureFormat::Astc { .. })
+    ));
+    assert_eq!(
+        texture::compressed_format(CompressedTextureFormat::PvrtcRgba4),
+        None
+    );
+}
 #[test]
 #[ignore = "requires a native GPU adapter"]
 fn gpu_draws_preserve_uniform_snapshots_and_scissor_origin() {
@@ -207,6 +250,80 @@ fn gpu_texture_roundtrip_handles_row_padding_and_rgb_alpha() {
         assert_eq!(ctx.texture_size(t), (5, 2));
         ctx.delete_texture(t);
     }
+}
+
+#[test]
+#[ignore = "requires a native GPU adapter with BC compression"]
+fn gpu_uploads_compressed_mipmaps_and_cubemaps() {
+    let mut ctx = gpu();
+    if !ctx
+        .compressed_texture_support()
+        .supports(CompressedTextureFormat::Bc1Rgba)
+    {
+        return;
+    }
+    let level0 = [0_u8; 32]; // 8x8: two by two BC1 blocks
+    let level1 = [0_u8; 8]; // 4x4: one BC1 block
+    let texture = ctx
+        .new_compressed_texture_checked(
+            TextureAccess::Static,
+            CompressedTextureSource::Mipmaps(&[&level0, &level1]),
+            CompressedTextureParams {
+                width: 8,
+                height: 8,
+                format: CompressedTextureFormat::Bc1Rgba,
+                mipmap_filter: MipmapFilterMode::Linear,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ctx.texture_size(texture), (8, 8));
+
+    let face = [&level0[..], &level1[..]];
+    let cube = [&face[..]; 6];
+    let cube = ctx
+        .new_compressed_texture_checked(
+            TextureAccess::Static,
+            CompressedTextureSource::CubeMap(&cube),
+            CompressedTextureParams {
+                kind: TextureKind::CubeMap,
+                width: 8,
+                height: 8,
+                format: CompressedTextureFormat::Bc1Rgba,
+                mipmap_filter: MipmapFilterMode::Linear,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    assert_eq!(ctx.texture_size(cube), (8, 8));
+    ctx.delete_texture(texture);
+    ctx.delete_texture(cube);
+}
+
+#[test]
+#[ignore = "requires a native GPU adapter with BC compression"]
+fn gpu_rejects_unaligned_compressed_dimensions_before_upload() {
+    let mut ctx = gpu();
+    if !ctx
+        .compressed_texture_support()
+        .supports(CompressedTextureFormat::Bc1Rgba)
+    {
+        return;
+    }
+    let bytes = [0_u8; 32];
+    assert!(matches!(
+        ctx.new_compressed_texture_checked(
+            TextureAccess::Static,
+            CompressedTextureSource::Mipmaps(&[&bytes]),
+            CompressedTextureParams {
+                width: 7,
+                height: 5,
+                format: CompressedTextureFormat::Bc1Rgba,
+                ..Default::default()
+            },
+        ),
+        Err(TextureError::UnsupportedDimensions { .. })
+    ));
 }
 #[test]
 #[ignore = "requires a native GPU adapter"]

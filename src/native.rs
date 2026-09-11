@@ -153,5 +153,8 @@ pub use wasm::webgl as gl;
 
 pub mod query_stab;
 
-#[cfg(feature = "wgpu")]
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "linux", target_os = "macos", target_os = "windows")
+))]
 pub(crate) mod wgpu_window;

@@ -8,6 +8,8 @@
 )]
 
 pub mod conf;
+#[cfg(all(feature = "wgpu", not(target_arch = "wasm32")))]
+pub mod embed;
 mod event;
 pub mod fs;
 pub mod graphics;
@@ -145,7 +147,7 @@ pub mod window {
     /// Creates the rendering backend selected by the native platform.
     pub fn new_rendering_backend() -> Box<dyn RenderingBackend> {
         #[cfg(feature = "wgpu")]
-        if let Some(context) = native::wgpu_window::take_context() {
+        if let Some(context) = crate::embed::take_context() {
             return Box::new(context);
         }
         #[cfg(target_vendor = "apple")]
@@ -536,7 +538,10 @@ pub fn start<F>(conf: conf::Conf, f: F)
 where
     F: 'static + FnOnce() -> Box<dyn EventHandler>,
 {
-    #[cfg(feature = "wgpu")]
+    #[cfg(all(
+        feature = "wgpu",
+        any(target_os = "linux", target_os = "macos", target_os = "windows")
+    ))]
     if conf.platform.prefer_gfx_api == conf::GfxApi::Wgpu {
         native::wgpu_window::run(conf, f);
         return;
@@ -594,10 +599,18 @@ where
         native::macos::run(conf, f);
     }
 
-    #[cfg(target_os = "ios")]
+    #[cfg(all(target_os = "ios", any(feature = "opengl", feature = "metal")))]
     unsafe {
         native::ios::run(conf, f);
     }
+
+    #[cfg(all(
+        target_os = "ios",
+        feature = "wgpu",
+        not(feature = "opengl"),
+        not(feature = "metal")
+    ))]
+    panic!("the iOS wgpu backend must be driven through miniquad::embed::WgpuEmbedHost");
 }
 
 #[cfg(target_env = "ohos")]

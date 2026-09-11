@@ -58,6 +58,135 @@ impl Texture {
             access,
         }
     }
+    pub fn new_compressed(
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        access: TextureAccess,
+        source: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> Self {
+        let format = compressed_format(params.format).expect("unsupported wgpu compressed format");
+        let levels = match &source {
+            CompressedTextureSource::Mipmaps(levels) => levels.len(),
+            CompressedTextureSource::CubeMap(faces) => faces[0].len(),
+        } as u32;
+        let gpu = device.create_texture(&wgpu::TextureDescriptor {
+            label: Some("miniquad compressed texture"),
+            size: wgpu::Extent3d {
+                width: params.width,
+                height: params.height,
+                depth_or_array_layers: if params.kind == TextureKind::CubeMap {
+                    6
+                } else {
+                    1
+                },
+            },
+            mip_level_count: levels,
+            sample_count: 1,
+            dimension: wgpu::TextureDimension::D2,
+            format,
+            usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+            view_formats: &[],
+        });
+        let view = gpu.create_view(&wgpu::TextureViewDescriptor {
+            dimension: Some(if params.kind == TextureKind::CubeMap {
+                wgpu::TextureViewDimension::Cube
+            } else {
+                wgpu::TextureViewDimension::D2
+            }),
+            ..Default::default()
+        });
+        let texture_params = TextureParams {
+            kind: params.kind,
+            format: TextureFormat::RGBA8,
+            wrap: params.wrap,
+            min_filter: params.min_filter,
+            mag_filter: params.mag_filter,
+            mipmap_filter: params.mipmap_filter,
+            width: params.width,
+            height: params.height,
+            allocate_mipmaps: levels > 1,
+            sample_count: 1,
+        };
+        let texture = Self {
+            gpu,
+            view,
+            sampler: sampler(device, &texture_params, params.wrap),
+            params: texture_params,
+            wrap_y: params.wrap,
+            access,
+        };
+        match source {
+            CompressedTextureSource::Mipmaps(levels) => {
+                for (mip, bytes) in levels.iter().enumerate() {
+                    texture.upload_compressed(
+                        queue,
+                        params.format,
+                        0,
+                        mip as u32,
+                        params.width,
+                        params.height,
+                        bytes,
+                    );
+                }
+            }
+            CompressedTextureSource::CubeMap(faces) => {
+                for (face, levels) in faces.iter().enumerate() {
+                    for (mip, bytes) in levels.iter().enumerate() {
+                        texture.upload_compressed(
+                            queue,
+                            params.format,
+                            face as u32,
+                            mip as u32,
+                            params.width,
+                            params.height,
+                            bytes,
+                        );
+                    }
+                }
+            }
+        }
+        texture
+    }
+    fn upload_compressed(
+        &self,
+        queue: &wgpu::Queue,
+        format: CompressedTextureFormat,
+        layer: u32,
+        mip: u32,
+        base_width: u32,
+        base_height: u32,
+        bytes: &[u8],
+    ) {
+        let width = (base_width >> mip).max(1);
+        let height = (base_height >> mip).max(1);
+        let (block_width, block_height) = format.block_extent();
+        let bytes_per_row = width.div_ceil(block_width) * format.bytes_per_block();
+        let rows_per_image = height.div_ceil(block_height);
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &self.gpu,
+                mip_level: mip,
+                origin: wgpu::Origin3d {
+                    x: 0,
+                    y: 0,
+                    z: layer,
+                },
+                aspect: wgpu::TextureAspect::All,
+            },
+            bytes,
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(bytes_per_row),
+                rows_per_image: Some(rows_per_image),
+            },
+            wgpu::Extent3d {
+                width,
+                height,
+                depth_or_array_layers: 1,
+            },
+        );
+    }
     pub fn update_sampler(&mut self, device: &wgpu::Device) {
         self.sampler = sampler(device, &self.params, self.wrap_y);
     }
@@ -314,6 +443,53 @@ fn pixel_size(f: TextureFormat) -> u32 {
         TextureFormat::RGBA16F => 8,
         _ => 4,
     }
+}
+pub(super) fn compressed_format(format: CompressedTextureFormat) -> Option<wgpu::TextureFormat> {
+    use wgpu::TextureFormat as W;
+    use CompressedTextureFormat::*;
+    Some(match format {
+        Bc1Rgb | Bc1Rgba => W::Bc1RgbaUnorm,
+        Bc2 => W::Bc2RgbaUnorm,
+        Bc3 => W::Bc3RgbaUnorm,
+        Bc4 => W::Bc4RUnorm,
+        Bc5 => W::Bc5RgUnorm,
+        Bc6hUnsigned => W::Bc6hRgbUfloat,
+        Bc6hSigned => W::Bc6hRgbFloat,
+        Bc7 => W::Bc7RgbaUnorm,
+        Etc2Rgb8 => W::Etc2Rgb8Unorm,
+        Etc2Rgb8A1 => W::Etc2Rgb8A1Unorm,
+        Etc2Rgba8 => W::Etc2Rgba8Unorm,
+        EacR11 => W::EacR11Unorm,
+        EacRg11 => W::EacRg11Unorm,
+        Astc {
+            block_width,
+            block_height,
+        } => W::Astc {
+            block: astc_block(block_width, block_height)?,
+            channel: wgpu::AstcChannel::Unorm,
+        },
+        PvrtcRgb2 | PvrtcRgb4 | PvrtcRgba2 | PvrtcRgba4 => return None,
+    })
+}
+fn astc_block(width: u8, height: u8) -> Option<wgpu::AstcBlock> {
+    use wgpu::AstcBlock as B;
+    Some(match (width, height) {
+        (4, 4) => B::B4x4,
+        (5, 4) => B::B5x4,
+        (5, 5) => B::B5x5,
+        (6, 5) => B::B6x5,
+        (6, 6) => B::B6x6,
+        (8, 5) => B::B8x5,
+        (8, 6) => B::B8x6,
+        (8, 8) => B::B8x8,
+        (10, 5) => B::B10x5,
+        (10, 6) => B::B10x6,
+        (10, 8) => B::B10x8,
+        (10, 10) => B::B10x10,
+        (12, 10) => B::B12x10,
+        (12, 12) => B::B12x12,
+        _ => return None,
+    })
 }
 pub(super) fn attachment(
     device: &wgpu::Device,

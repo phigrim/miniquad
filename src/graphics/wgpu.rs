@@ -2,7 +2,7 @@
 use super::*;
 use crate::ResourceManager;
 use ::wgpu;
-use std::{cell::RefCell, collections::HashMap, sync::Arc};
+use std::{cell::RefCell, collections::HashMap, rc::Rc, sync::Arc};
 use wgpu::util::DeviceExt;
 mod pipeline;
 mod shader;
@@ -38,11 +38,10 @@ struct Target {
     height: u32,
 }
 
-/// The wgpu implementation of [`RenderingBackend`].
-/// Created by `window::new_rendering_backend` when `GfxApi::Wgpu` is selected.
-pub struct WgpuContext {
+struct SurfaceState {
+    instance: wgpu::Instance,
+    adapter: wgpu::Adapter,
     device: wgpu::Device,
-    queue: wgpu::Queue,
     surface: Option<wgpu::Surface<'static>>,
     config: Option<wgpu::SurfaceConfiguration>,
     window: Option<Arc<winit::window::Window>>,
@@ -50,6 +49,127 @@ pub struct WgpuContext {
     default_color: Option<wgpu::Texture>,
     default_depth: Option<wgpu::Texture>,
     samples: u32,
+    present_mode: wgpu::PresentMode,
+    framebuffer_alpha: bool,
+}
+
+#[derive(Debug)]
+pub(crate) enum SurfaceInitError {
+    Surface(String),
+    AdapterUnavailable,
+    Device(String),
+    Unsupported,
+}
+
+#[derive(Clone)]
+pub(crate) struct SurfaceController(Rc<RefCell<SurfaceState>>);
+
+impl SurfaceController {
+    pub(crate) fn attach_window(
+        &self,
+        window: Arc<winit::window::Window>,
+    ) -> Result<(), SurfaceInitError> {
+        let mut state = self.0.borrow_mut();
+        let surface = state
+            .instance
+            .create_surface(window.clone())
+            .map_err(|error| SurfaceInitError::Surface(error.to_string()))?;
+        let size = window.inner_size();
+        let mut config = surface
+            .get_default_config(&state.adapter, size.width.max(1), size.height.max(1))
+            .ok_or(SurfaceInitError::Unsupported)?;
+        let capabilities = surface.get_capabilities(&state.adapter);
+        config.format = capabilities
+            .formats
+            .into_iter()
+            .find(|format| !format.is_srgb())
+            .unwrap_or(config.format);
+        config.present_mode = state.present_mode;
+        if !state.framebuffer_alpha
+            && capabilities
+                .alpha_modes
+                .contains(&wgpu::CompositeAlphaMode::Opaque)
+        {
+            config.alpha_mode = wgpu::CompositeAlphaMode::Opaque;
+        }
+        surface.configure(&state.device, &config);
+        state.surface = Some(surface);
+        state.config = Some(config);
+        state.window = Some(window);
+        state.frame = None;
+        state.default_color = None;
+        state.default_depth = None;
+        Ok(())
+    }
+
+    pub(crate) fn detach_window(&self) {
+        let mut state = self.0.borrow_mut();
+        state.frame = None;
+        state.default_color = None;
+        state.default_depth = None;
+        state.surface = None;
+        state.config = None;
+        state.window = None;
+    }
+}
+
+fn compressed_texture_support(features: wgpu::Features) -> CompressedTextureSupport {
+    let mut support = CompressedTextureSupport::empty();
+    if features.contains(wgpu::Features::TEXTURE_COMPRESSION_BC) {
+        support.enable_all(&[
+            CompressedTextureFormat::Bc1Rgb,
+            CompressedTextureFormat::Bc1Rgba,
+            CompressedTextureFormat::Bc2,
+            CompressedTextureFormat::Bc3,
+            CompressedTextureFormat::Bc4,
+            CompressedTextureFormat::Bc5,
+            CompressedTextureFormat::Bc6hUnsigned,
+            CompressedTextureFormat::Bc6hSigned,
+            CompressedTextureFormat::Bc7,
+        ]);
+    }
+    if features.contains(wgpu::Features::TEXTURE_COMPRESSION_ETC2) {
+        support.enable_all(&[
+            CompressedTextureFormat::Etc2Rgb8,
+            CompressedTextureFormat::Etc2Rgb8A1,
+            CompressedTextureFormat::Etc2Rgba8,
+            CompressedTextureFormat::EacR11,
+            CompressedTextureFormat::EacRg11,
+        ]);
+    }
+    if features.contains(wgpu::Features::TEXTURE_COMPRESSION_ASTC) {
+        for &(block_width, block_height) in &[
+            (4, 4),
+            (5, 4),
+            (5, 5),
+            (6, 5),
+            (6, 6),
+            (8, 5),
+            (8, 6),
+            (8, 8),
+            (10, 5),
+            (10, 6),
+            (10, 8),
+            (10, 10),
+            (12, 10),
+            (12, 12),
+        ] {
+            support.enable(CompressedTextureFormat::Astc {
+                block_width,
+                block_height,
+            });
+        }
+    }
+    support
+}
+
+/// The wgpu implementation of [`RenderingBackend`].
+/// Created by `window::new_rendering_backend` when `GfxApi::Wgpu` is selected.
+pub struct WgpuContext {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    surface: Rc<RefCell<SurfaceState>>,
+    compressed_texture_support: CompressedTextureSupport,
     shaders: ResourceManager<Shader>,
     textures: ResourceManager<Texture>,
     // Macroquad collects textures after commit_frame. A cached draw may still
@@ -71,60 +191,81 @@ impl WgpuContext {
     pub(crate) async fn for_window(
         window: Arc<winit::window::Window>,
         conf: &crate::conf::Conf,
-    ) -> Self {
+    ) -> Result<(Self, SurfaceController), SurfaceInitError> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
         let surface = instance
             .create_surface(window.clone())
-            .expect("create wgpu surface");
+            .map_err(|error| SurfaceInitError::Surface(error.to_string()))?;
         let adapter = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 compatible_surface: Some(&surface),
                 ..Default::default()
             })
             .await
-            .expect("no compatible wgpu adapter");
-        let mut context = Self::from_adapter(adapter.clone()).await;
-        let size = window.inner_size();
-        let mut config = surface
-            .get_default_config(&adapter, size.width.max(1), size.height.max(1))
-            .expect("surface configuration");
-        // Existing miniquad shaders produce display values, with no implicit sRGB conversion.
-        config.format = surface
-            .get_capabilities(&adapter)
-            .formats
-            .into_iter()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(config.format);
-        config.present_mode = if conf.platform.swap_interval == Some(0) {
-            wgpu::PresentMode::AutoNoVsync
-        } else {
-            wgpu::PresentMode::AutoVsync
-        };
-        surface.configure(&context.device, &config);
-        context.surface = Some(surface);
-        context.config = Some(config);
-        context.window = Some(window);
-        context.samples = conf.sample_count.max(1) as u32;
-        context
+            .map_err(|_| SurfaceInitError::AdapterUnavailable)?;
+        drop(surface);
+        let context = Self::from_adapter_with_instance(
+            instance,
+            adapter,
+            conf.sample_count.max(1) as u32,
+            if conf.platform.swap_interval == Some(0) {
+                wgpu::PresentMode::AutoNoVsync
+            } else {
+                wgpu::PresentMode::AutoVsync
+            },
+            conf.platform.framebuffer_alpha,
+        )
+        .await?;
+        let controller = SurfaceController(context.surface.clone());
+        controller.attach_window(window)?;
+        Ok((context, controller))
     }
+    #[cfg(test)]
     async fn from_adapter(adapter: wgpu::Adapter) -> Self {
+        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        Self::from_adapter_with_instance(instance, adapter, 1, wgpu::PresentMode::AutoVsync, false)
+            .await
+            .expect("create wgpu device")
+    }
+    async fn from_adapter_with_instance(
+        instance: wgpu::Instance,
+        adapter: wgpu::Adapter,
+        samples: u32,
+        present_mode: wgpu::PresentMode,
+        framebuffer_alpha: bool,
+    ) -> Result<Self, SurfaceInitError> {
+        let adapter_features = adapter.features();
+        let compression_features = adapter_features
+            & (wgpu::Features::TEXTURE_COMPRESSION_BC
+                | wgpu::Features::TEXTURE_COMPRESSION_ETC2
+                | wgpu::Features::TEXTURE_COMPRESSION_ASTC);
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: Some("miniquad"),
+                required_features: compression_features,
                 ..Default::default()
             })
             .await
-            .expect("create wgpu device");
-        Self {
-            device,
-            queue,
+            .map_err(|error| SurfaceInitError::Device(error.to_string()))?;
+        let surface = Rc::new(RefCell::new(SurfaceState {
+            instance,
+            adapter,
+            device: device.clone(),
             surface: None,
             config: None,
             window: None,
             frame: None,
             default_color: None,
             default_depth: None,
-            samples: 1,
+            samples,
+            present_mode,
+            framebuffer_alpha,
+        }));
+        Ok(Self {
+            device,
+            queue,
+            surface,
+            compressed_texture_support: compressed_texture_support(compression_features),
             shaders: Default::default(),
             textures: Default::default(),
             retired_textures: HashMap::new(),
@@ -138,7 +279,7 @@ impl WgpuContext {
             uniforms: vec![],
             viewport: None,
             scissor: None,
-        }
+        })
     }
     fn submit(&self) {
         if let Some(encoder) = self.encoder.borrow_mut().take() {
@@ -172,34 +313,43 @@ impl WgpuContext {
     }
     fn default_target(&mut self) -> Option<Target> {
         let window = self
+            .surface
+            .borrow()
             .window
-            .as_ref()
+            .clone()
             .expect("headless contexts require an offscreen pass");
         let size = window.inner_size();
         if size.width == 0 || size.height == 0 {
             return None;
         }
-        let config = self.config.as_mut().unwrap();
-        if self.frame.is_none() {
-            if config.width != size.width || config.height != size.height {
-                self.submit();
-                let config = self.config.as_mut().unwrap();
-                config.width = size.width;
-                config.height = size.height;
-                self.surface
-                    .as_ref()
-                    .unwrap()
-                    .configure(&self.device, config);
-                self.default_color = None;
-                self.default_depth = None;
-            }
-
-            let surface = self.surface.as_ref().unwrap();
-            self.frame = match surface.get_current_texture() {
+        let resize = {
+            let state = self.surface.borrow();
+            let config = state.config.as_ref().unwrap();
+            config.width != size.width || config.height != size.height
+        };
+        if resize {
+            self.submit();
+            let mut state = self.surface.borrow_mut();
+            let mut config = state.config.take().unwrap();
+            config.width = size.width;
+            config.height = size.height;
+            state
+                .surface
+                .as_ref()
+                .unwrap()
+                .configure(&self.device, &config);
+            state.config = Some(config);
+            state.default_color = None;
+            state.default_depth = None;
+        }
+        let mut state = self.surface.borrow_mut();
+        if state.frame.is_none() {
+            let surface = state.surface.as_ref().unwrap();
+            state.frame = match surface.get_current_texture() {
                 wgpu::CurrentSurfaceTexture::Success(t)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(t) => Some(t),
                 wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
-                    surface.configure(&self.device, self.config.as_ref().unwrap());
+                    surface.configure(&self.device, state.config.as_ref().unwrap());
                     None
                 }
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
@@ -208,20 +358,20 @@ impl WgpuContext {
                 wgpu::CurrentSurfaceTexture::Validation => panic!("wgpu surface validation failed"),
             };
         }
-        let config = self.config.as_ref().unwrap();
-        let frame = self.frame.as_ref()?;
+        let format = state.config.as_ref().unwrap().format;
+        let frame = state.frame.as_ref()?;
         let mut color = frame.texture.create_view(&Default::default());
         let mut resolves = vec![];
         let device = &self.device;
-        let samples = self.samples;
-        if self.samples > 1 {
-            let texture = self.default_color.get_or_insert_with(|| {
-                texture::attachment(device, size.width, size.height, config.format, samples)
+        let samples = state.samples;
+        if samples > 1 {
+            let texture = state.default_color.get_or_insert_with(|| {
+                texture::attachment(device, size.width, size.height, format, samples)
             });
             resolves.push(color);
             color = texture.create_view(&Default::default());
         }
-        let depth = self.default_depth.get_or_insert_with(|| {
+        let depth = state.default_depth.get_or_insert_with(|| {
             texture::attachment(
                 device,
                 size.width,
@@ -235,9 +385,9 @@ impl WgpuContext {
             resolves,
             depth: Some(depth.create_view(&Default::default())),
             key: TargetKey {
-                colors: vec![config.format],
+                colors: vec![format],
                 depth: Some(wgpu::TextureFormat::Depth24PlusStencil8),
-                samples: self.samples,
+                samples,
             },
             width: size.width,
             height: size.height,
@@ -323,6 +473,23 @@ impl RenderingBackend for WgpuContext {
             features: Features::default(),
         }
     }
+    fn compressed_texture_support(&self) -> CompressedTextureSupport {
+        self.compressed_texture_support
+    }
+    fn validate_compressed_texture_params(
+        &self,
+        params: &CompressedTextureParams,
+    ) -> Result<(), TextureError> {
+        let (block_width, block_height) = params.format.block_extent();
+        if params.width % block_width != 0 || params.height % block_height != 0 {
+            return Err(TextureError::UnsupportedDimensions {
+                format: params.format,
+                width: params.width,
+                height: params.height,
+            });
+        }
+        Ok(())
+    }
     fn new_shader(
         &mut self,
         source: ShaderSource,
@@ -363,6 +530,15 @@ impl RenderingBackend for WgpuContext {
             }
         }
         id
+    }
+    fn new_compressed_texture(
+        &mut self,
+        access: TextureAccess,
+        source: CompressedTextureSource,
+        params: CompressedTextureParams,
+    ) -> TextureId {
+        let texture = Texture::new_compressed(&self.device, &self.queue, access, source, params);
+        TextureId(TextureIdInner::Managed(self.textures.add(texture)))
     }
     fn texture_params(&self, id: TextureId) -> TextureParams {
         self.texture(id).params
@@ -606,8 +782,9 @@ impl RenderingBackend for WgpuContext {
     fn commit_frame(&mut self) {
         assert!(self.target.is_none(), "end render pass before commit");
         self.submit();
-        if let Some(frame) = self.frame.take() {
-            if let Some(window) = &self.window {
+        let mut state = self.surface.borrow_mut();
+        if let Some(frame) = state.frame.take() {
+            if let Some(window) = &state.window {
                 window.pre_present_notify();
             }
             frame.present();
