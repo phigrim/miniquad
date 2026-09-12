@@ -18,6 +18,24 @@ struct Buffer {
     kind: BufferType,
 }
 
+/// Fully resolved state for one miniquad draw. Keeping these until
+/// `end_render_pass` lets the wgpu backend encode adjacent miniquad draws into
+/// one native render pass instead of paying render-pass setup per draw.
+struct DrawCommand {
+    pipeline: wgpu::RenderPipeline,
+    bind_group: wgpu::BindGroup,
+    uniform_offset: u32,
+    vertices: Vec<wgpu::Buffer>,
+    index: wgpu::Buffer,
+    index_format: wgpu::IndexFormat,
+    base: u32,
+    count: u32,
+    instances: u32,
+    viewport: Option<(f32, f32, f32, f32)>,
+    scissor: Option<(u32, u32, u32, u32)>,
+    stencil_reference: Option<u32>,
+}
+
 struct UniformBufferArena {
     gpu: wgpu::Buffer,
     capacity: u64,
@@ -204,6 +222,7 @@ pub struct WgpuContext {
     uniform_buffer: RefCell<Option<UniformBufferArena>>,
     bind_groups: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
     staging_belt: RefCell<wgpu::util::StagingBelt>,
+    pending_draws: RefCell<Vec<DrawCommand>>,
     uniform_alignment: u64,
     viewport: Option<(f32, f32, f32, f32)>,
     scissor: Option<(u32, u32, u32, u32)>,
@@ -304,12 +323,17 @@ impl WgpuContext {
             uniform_buffer: RefCell::new(None),
             bind_groups: RefCell::new(HashMap::new()),
             staging_belt: RefCell::new(staging_belt),
+            pending_draws: RefCell::new(vec![]),
             uniform_alignment,
             viewport: None,
             scissor: None,
         })
     }
     fn submit(&mut self) {
+        // Some resource operations submit outside the normal frame boundary.
+        // Do not let a deferred logical draw disappear when one of them is
+        // called between begin_pass and end_render_pass.
+        self.flush_draws();
         self.staging_belt.get_mut().finish();
         if let Some(encoder) = self.encoder.borrow_mut().take() {
             self.queue.submit([encoder.finish()]);
@@ -325,6 +349,41 @@ impl WgpuContext {
                     label: Some("miniquad frame"),
                 })
         }));
+    }
+    /// Finish the logical miniquad pass accumulated since `begin_pass`.
+    ///
+    /// wgpu render passes cannot outlive the closure that creates them, so
+    /// retaining resolved draw state is the only way to preserve miniquad's
+    /// immediate API while still submitting one native render pass.
+    fn flush_draws(&self) {
+        let commands = std::mem::take(&mut *self.pending_draws.borrow_mut());
+        if commands.is_empty() {
+            return;
+        }
+        self.render(&PassAction::Nothing, |pass| {
+            for command in &commands {
+                pass.set_pipeline(&command.pipeline);
+                pass.set_bind_group(0, &command.bind_group, &[command.uniform_offset]);
+                for (i, buffer) in command.vertices.iter().enumerate() {
+                    pass.set_vertex_buffer(i as u32, buffer.slice(..));
+                }
+                pass.set_index_buffer(command.index.slice(..), command.index_format);
+                if let Some((x, y, w, h)) = command.viewport {
+                    pass.set_viewport(x, y, w, h, 0., 1.);
+                }
+                if let Some((x, y, w, h)) = command.scissor {
+                    pass.set_scissor_rect(x, y, w, h);
+                }
+                if let Some(stencil) = command.stencil_reference {
+                    pass.set_stencil_reference(stencil);
+                }
+                pass.draw_indexed(
+                    command.base..command.base + command.count,
+                    0,
+                    0..command.instances,
+                );
+            }
+        });
     }
     fn texture(&self, id: TextureId) -> &Texture {
         match id.0 {
@@ -774,7 +833,18 @@ impl RenderingBackend for WgpuContext {
         }))
     }
     fn buffer_update(&mut self, id: BufferId, data: BufferSource) {
-        let (bytes, element_size) = buffer_bytes(data);
+        // Match the other backends: an empty source reserves capacity only and
+        // is not a valid update. This also avoids materialising a zero-filled
+        // Vec merely to reject an operation that OpenGL/Metal reject.
+        let data = match data {
+            BufferSource::Slice(data) => data,
+            BufferSource::Empty { .. } => panic!("buffer_update expects BufferSource::slice"),
+        };
+        // Preserve the immediate API's ordering guarantee. A later upload to
+        // this buffer must not become visible to an earlier deferred draw.
+        self.flush_draws();
+        let bytes = unsafe { std::slice::from_raw_parts(data.ptr as *const u8, data.size) };
+        let element_size = data.element_size;
         let device = self.device.clone();
         let b = &mut self.buffers[id.0];
         assert!(
@@ -782,7 +852,7 @@ impl RenderingBackend for WgpuContext {
             "buffer update exceeds capacity"
         );
         assert!(b.kind != BufferType::IndexBuffer || element_size == b.element_size);
-        b.bytes[..bytes.len()].copy_from_slice(&bytes);
+        b.bytes[..bytes.len()].copy_from_slice(bytes);
         // Macroquad updates its stream geometry every frame. Recreating the
         // wgpu buffer here leaves the old Metal buffers alive until the GPU
         // finishes with them, which creates a large transient footprint and
@@ -894,6 +964,7 @@ impl RenderingBackend for WgpuContext {
         depth: Option<f32>,
         stencil: Option<i32>,
     ) {
+        self.flush_draws();
         self.render(
             &PassAction::Clear {
                 color,
@@ -945,6 +1016,7 @@ impl RenderingBackend for WgpuContext {
         }
     }
     fn end_render_pass(&mut self) {
+        self.flush_draws();
         self.target = None;
     }
     fn commit_frame(&mut self) {
@@ -987,37 +1059,27 @@ impl RenderingBackend for WgpuContext {
         let vertices = p.vertex_buffers(&self.device, &self.buffers, &bindings.vertex_buffers);
         let index = &self.buffers[bindings.index_buffer.0];
         assert!((base as usize + count as usize) * index.element_size <= index.bytes.len());
-        self.render(&PassAction::Nothing, |pass| {
-            pass.set_pipeline(&pipeline);
-            pass.set_bind_group(
-                0,
-                &group,
-                &[{
-                    assert!(uniform_offset <= u64::from(u32::MAX));
-                    uniform_offset as u32
-                }],
-            );
-            for (i, b) in vertices.iter().enumerate() {
-                pass.set_vertex_buffer(i as _, b.slice(..));
-            }
-            pass.set_index_buffer(
-                index.gpu.slice(..),
-                if index.element_size == 4 {
-                    wgpu::IndexFormat::Uint32
-                } else {
-                    wgpu::IndexFormat::Uint16
-                },
-            );
-            if let Some((x, y, w, h)) = self.viewport {
-                pass.set_viewport(x, y, w, h, 0., 1.);
-            }
-            if let Some((x, y, w, h)) = self.scissor {
-                pass.set_scissor_rect(x, y, w, h);
-            }
-            if let Some(stencil) = p.params.stencil_test {
-                pass.set_stencil_reference(stencil.front.test_ref as _);
-            }
-            pass.draw_indexed(base as u32..(base + count) as u32, 0, 0..instances as u32);
+        assert!(uniform_offset <= u64::from(u32::MAX));
+        self.pending_draws.borrow_mut().push(DrawCommand {
+            pipeline,
+            bind_group: group,
+            uniform_offset: uniform_offset as u32,
+            vertices,
+            index: index.gpu.clone(),
+            index_format: if index.element_size == 4 {
+                wgpu::IndexFormat::Uint32
+            } else {
+                wgpu::IndexFormat::Uint16
+            },
+            base: base as u32,
+            count: count as u32,
+            instances: instances as u32,
+            viewport: self.viewport,
+            scissor: self.scissor,
+            stencil_reference: p
+                .params
+                .stencil_test
+                .map(|stencil| stencil.front.test_ref as u32),
         });
     }
 }
@@ -1044,6 +1106,7 @@ fn buffer_bytes(source: BufferSource) -> (Vec<u8>, usize) {
         ),
     }
 }
+
 fn make_buffer(
     device: &wgpu::Device,
     kind: BufferType,
