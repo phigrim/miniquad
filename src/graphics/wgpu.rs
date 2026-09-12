@@ -48,6 +48,16 @@ struct BindGroupKey {
     images: Vec<TextureId>,
 }
 
+/// The overwhelmingly common binding pattern is the same pipeline/material
+/// across adjacent draws. Metal records that state directly; keep the same
+/// fast path here so a wgpu draw does not allocate a HashMap key merely to
+/// rediscover the bind group from the preceding draw.
+struct CachedBindGroup {
+    shader: usize,
+    images: Vec<TextureId>,
+    group: wgpu::BindGroup,
+}
+
 struct Pass {
     colors: Vec<TextureId>,
     resolves: Vec<TextureId>,
@@ -219,8 +229,10 @@ pub struct WgpuContext {
     current_pipeline: Option<Pipeline>,
     bindings: Option<Bindings>,
     uniforms: Vec<u8>,
+    packed_uniforms: RefCell<Vec<u8>>,
     uniform_buffer: RefCell<Option<UniformBufferArena>>,
     bind_groups: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
+    last_bind_group: RefCell<Option<CachedBindGroup>>,
     staging_belt: RefCell<wgpu::util::StagingBelt>,
     pending_draws: RefCell<Vec<DrawCommand>>,
     uniform_alignment: u64,
@@ -320,8 +332,10 @@ impl WgpuContext {
             current_pipeline: None,
             bindings: None,
             uniforms: vec![],
+            packed_uniforms: RefCell::new(vec![]),
             uniform_buffer: RefCell::new(None),
             bind_groups: RefCell::new(HashMap::new()),
+            last_bind_group: RefCell::new(None),
             staging_belt: RefCell::new(staging_belt),
             pending_draws: RefCell::new(vec![]),
             uniform_alignment,
@@ -572,6 +586,7 @@ impl WgpuContext {
                 offset: 0,
             });
             self.bind_groups.borrow_mut().clear();
+            self.last_bind_group.borrow_mut().take();
         }
         let arena_ref = arena.as_mut().expect("uniform buffer arena initialized");
         let offset = align_up(arena_ref.offset, self.uniform_alignment);
@@ -610,11 +625,24 @@ impl WgpuContext {
         uniform: &wgpu::Buffer,
         uniform_size: u64,
     ) -> wgpu::BindGroup {
+        {
+            let last = self.last_bind_group.borrow();
+            if let Some(cached) = last.as_ref() {
+                if cached.shader == shader_id && cached.images == bindings.images {
+                    return cached.group.clone();
+                }
+            }
+        }
         let key = BindGroupKey {
             shader: shader_id,
             images: bindings.images.clone(),
         };
         if let Some(group) = self.bind_groups.borrow().get(&key).cloned() {
+            *self.last_bind_group.borrow_mut() = Some(CachedBindGroup {
+                shader: shader_id,
+                images: bindings.images.clone(),
+                group: group.clone(),
+            });
             return group;
         }
 
@@ -643,6 +671,11 @@ impl WgpuContext {
             entries: &entries,
         });
         self.bind_groups.borrow_mut().insert(key, group.clone());
+        *self.last_bind_group.borrow_mut() = Some(CachedBindGroup {
+            shader: shader_id,
+            images: bindings.images.clone(),
+            group: group.clone(),
+        });
         group
     }
 }
@@ -903,6 +936,7 @@ impl RenderingBackend for WgpuContext {
     fn delete_texture(&mut self, id: TextureId) {
         if let TextureIdInner::Managed(id) = id.0 {
             self.bind_groups.borrow_mut().clear();
+            self.last_bind_group.get_mut().take();
             // Deletion can happen immediately after commit_frame while higher
             // layers still have a cached raw TextureId to flush. Resource ids
             // are monotonic, so retaining the old value cannot alias a new
@@ -915,6 +949,7 @@ impl RenderingBackend for WgpuContext {
     }
     fn delete_shader(&mut self, id: ShaderId) {
         self.bind_groups.borrow_mut().clear();
+        self.last_bind_group.get_mut().take();
         self.shaders.remove(id.0);
     }
     fn apply_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {
@@ -945,18 +980,29 @@ impl RenderingBackend for WgpuContext {
         ));
     }
     fn apply_bindings_from_slice(&mut self, v: &[BufferId], i: BufferId, t: &[TextureId]) {
-        self.bindings = Some(Bindings {
-            vertex_buffers: v.to_vec(),
-            index_buffer: i,
-            images: t.to_vec(),
-        });
+        // Unlike Metal's encoder API, wgpu needs us to retain this state until
+        // draw. Reuse the small vectors instead of allocating on every batch.
+        if let Some(bindings) = &mut self.bindings {
+            bindings.vertex_buffers.clear();
+            bindings.vertex_buffers.extend_from_slice(v);
+            bindings.index_buffer = i;
+            bindings.images.clear();
+            bindings.images.extend_from_slice(t);
+        } else {
+            self.bindings = Some(Bindings {
+                vertex_buffers: v.to_vec(),
+                index_buffer: i,
+                images: t.to_vec(),
+            });
+        }
     }
     fn apply_uniforms_from_bytes(&mut self, ptr: *const u8, size: usize) {
-        self.uniforms = if size == 0 {
-            vec![]
-        } else {
-            unsafe { std::slice::from_raw_parts(ptr, size) }.to_vec()
-        };
+        self.uniforms.clear();
+        if size != 0 {
+            // SAFETY: RenderingBackend consumes uniform input synchronously.
+            self.uniforms
+                .extend_from_slice(unsafe { std::slice::from_raw_parts(ptr, size) });
+        }
     }
     fn clear(
         &mut self,
@@ -1051,8 +1097,12 @@ impl RenderingBackend for WgpuContext {
         let shader = &self.shaders[p.shader.0];
         let bindings = self.bindings.as_ref().expect("apply bindings before draw");
         assert_eq!(bindings.images.len(), shader.images);
-        let packed_uniform = shader.uniforms.pack(&self.uniforms);
+        let mut packed_uniform = self.packed_uniforms.borrow_mut();
+        shader
+            .uniforms
+            .pack_into(&self.uniforms, &mut packed_uniform);
         let (uniform, uniform_offset, uniform_size) = self.allocate_uniform(&packed_uniform);
+        drop(packed_uniform);
         let group = self.bind_group(p.shader.0, shader, bindings, &uniform, uniform_size);
         let target = self.target.as_ref().unwrap();
         let pipeline = p.get(&self.device, shader, &target.key);

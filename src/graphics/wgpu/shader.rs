@@ -51,16 +51,18 @@ impl UniformLayout {
         out.size = align_up(out.size.max(1), 16);
         out
     }
-    pub fn pack(&self, input: &[u8]) -> Vec<u8> {
+    /// Pack into caller-owned scratch storage so hot draw paths can reuse the
+    /// allocation from the preceding draw.
+    pub fn pack_into(&self, input: &[u8], result: &mut Vec<u8>) {
         assert!(
             input.len() >= self.packed_size,
             "uniform block is too small"
         );
-        let mut result = vec![0; self.size];
+        result.clear();
+        result.resize(self.size, 0);
         for &(src, dst, len) in &self.copies {
             result[dst..dst + len].copy_from_slice(&input[src..src + len]);
         }
-        result
     }
 }
 pub(super) fn align_up(value: usize, alignment: usize) -> usize {

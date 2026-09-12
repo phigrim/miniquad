@@ -78,7 +78,8 @@ fn packed_uniforms_are_relocated_without_reading_padding() {
     };
     let layout = shader::UniformLayout::new(&meta);
     let data: Vec<u8> = (0..layout.packed_size).map(|v| v as u8).collect();
-    let packed = layout.pack(&data);
+    let mut packed = vec![];
+    layout.pack_into(&data, &mut packed);
     assert_eq!(layout.packed_size, 88);
     assert_eq!(layout.size, 128);
     assert_eq!(&packed[0..4], &data[0..4]);
