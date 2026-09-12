@@ -87,7 +87,7 @@ impl PipelineState {
         device: &wgpu::Device,
         buffers: &ResourceManager<Buffer>,
         ids: &[BufferId],
-        result: &mut Vec<wgpu::Buffer>,
+        result: &mut Vec<ResolvedBuffer>,
     ) {
         result.clear();
         result.extend(self.layouts.iter().enumerate().map(|(i, l)| {
@@ -105,7 +105,10 @@ impl PipelineState {
             }) || l.input_stride != l.stride as usize
                 || l.rate != 1;
             if !needs_conversion {
-                return b.gpu.clone();
+                return ResolvedBuffer {
+                    gpu: b.gpu.clone(),
+                    offset: b.gpu_offset,
+                };
             }
             let mut data = vec![];
             for v in b.bytes.chunks_exact(l.input_stride) {
@@ -143,7 +146,10 @@ impl PipelineState {
                     }
                 }
             }
-            make_buffer(device, BufferType::VertexBuffer, 1, &data)
+            ResolvedBuffer {
+                gpu: make_buffer(device, BufferType::VertexBuffer, 1, &data),
+                offset: 0,
+            }
         }))
     }
     pub fn get(

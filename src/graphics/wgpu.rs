@@ -2,6 +2,8 @@
 use super::*;
 use crate::ResourceManager;
 use ::wgpu;
+#[cfg(test)]
+use std::cell::Cell;
 use std::{borrow::Cow, cell::RefCell, collections::HashMap, num::NonZeroU64, rc::Rc, sync::Arc};
 use wgpu::util::DeviceExt;
 mod pipeline;
@@ -13,9 +15,22 @@ use texture::Texture;
 
 struct Buffer {
     gpu: wgpu::Buffer,
+    gpu_offset: u64,
     bytes: Vec<u8>,
     element_size: usize,
     kind: BufferType,
+    usage: BufferUsage,
+}
+
+struct GeometryBufferArena {
+    gpu: wgpu::Buffer,
+    capacity: u64,
+    offset: u64,
+}
+
+pub(super) struct ResolvedBuffer {
+    gpu: wgpu::Buffer,
+    offset: u64,
 }
 
 /// Fully resolved state for one miniquad draw. Keeping these until
@@ -25,8 +40,9 @@ struct DrawCommand {
     pipeline: wgpu::RenderPipeline,
     bind_group: wgpu::BindGroup,
     uniform_offset: u32,
-    vertices: Vec<wgpu::Buffer>,
+    vertices: Vec<ResolvedBuffer>,
     index: wgpu::Buffer,
+    index_offset: u64,
     index_format: wgpu::IndexFormat,
     base: u32,
     count: u32,
@@ -122,7 +138,12 @@ impl SurfaceController {
         // Metal allocates `maximum_frame_latency + 1` drawables. The default
         // of two therefore keeps three full-size IOSurfaces alive; Entry does
         // not need that extra frame of latency and pays for it in footprint.
-        config.desired_maximum_frame_latency = 1;
+        // Do not force this on DX12: a single frame in flight serializes more
+        // CPU/GPU work and measurably hurts uncapped high-frame-rate workloads.
+        #[cfg(target_os = "macos")]
+        {
+            config.desired_maximum_frame_latency = 1;
+        }
         let capabilities = surface.get_capabilities(&state.adapter);
         config.format = capabilities
             .formats
@@ -226,19 +247,24 @@ pub struct WgpuContext {
     passes: ResourceManager<Pass>,
     encoder: RefCell<Option<wgpu::CommandEncoder>>,
     target: Option<Target>,
+    target_pass: Option<Option<RenderPass>>,
+    pass_active: bool,
     current_pipeline: Option<Pipeline>,
     bindings: Option<Bindings>,
     uniforms: Vec<u8>,
     packed_uniforms: RefCell<Vec<u8>>,
     uniform_buffer: RefCell<Option<UniformBufferArena>>,
+    geometry_buffer: Option<GeometryBufferArena>,
     bind_groups: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
     last_bind_group: RefCell<Option<CachedBindGroup>>,
     staging_belt: RefCell<wgpu::util::StagingBelt>,
     pending_draws: RefCell<Vec<DrawCommand>>,
-    vertex_buffer_pool: RefCell<Vec<Vec<wgpu::Buffer>>>,
+    vertex_buffer_pool: RefCell<Vec<Vec<ResolvedBuffer>>>,
     uniform_alignment: u64,
     viewport: Option<(f32, f32, f32, f32)>,
     scissor: Option<(u32, u32, u32, u32)>,
+    #[cfg(test)]
+    native_render_passes: Cell<usize>,
 }
 impl WgpuContext {
     pub(crate) async fn for_window(
@@ -331,11 +357,14 @@ impl WgpuContext {
             passes: Default::default(),
             encoder: RefCell::new(None),
             target: None,
+            target_pass: None,
+            pass_active: false,
             current_pipeline: None,
             bindings: None,
             uniforms: vec![],
             packed_uniforms: RefCell::new(vec![]),
             uniform_buffer: RefCell::new(None),
+            geometry_buffer: None,
             bind_groups: RefCell::new(HashMap::new()),
             last_bind_group: RefCell::new(None),
             staging_belt: RefCell::new(staging_belt),
@@ -344,6 +373,8 @@ impl WgpuContext {
             uniform_alignment,
             viewport: None,
             scissor: None,
+            #[cfg(test)]
+            native_render_passes: Cell::new(0),
         })
     }
     fn submit(&mut self) {
@@ -382,9 +413,12 @@ impl WgpuContext {
                 pass.set_pipeline(&command.pipeline);
                 pass.set_bind_group(0, &command.bind_group, &[command.uniform_offset]);
                 for (i, buffer) in command.vertices.iter().enumerate() {
-                    pass.set_vertex_buffer(i as u32, buffer.slice(..));
+                    pass.set_vertex_buffer(i as u32, buffer.gpu.slice(buffer.offset..));
                 }
-                pass.set_index_buffer(command.index.slice(..), command.index_format);
+                pass.set_index_buffer(
+                    command.index.slice(command.index_offset..),
+                    command.index_format,
+                );
                 if let Some((x, y, w, h)) = command.viewport {
                     pass.set_viewport(x, y, w, h, 0., 1.);
                 }
@@ -516,6 +550,9 @@ impl WgpuContext {
         let Some(target) = &self.target else {
             return;
         };
+        #[cfg(test)]
+        self.native_render_passes
+            .set(self.native_render_passes.get() + 1);
         let (color, depth, stencil) = match action {
             PassAction::Nothing => (None, None, None),
             PassAction::Clear {
@@ -804,6 +841,17 @@ impl RenderingBackend for WgpuContext {
     }
     fn texture_resize(&mut self, id: TextureId, width: u32, height: u32, bytes: Option<&[u8]>) {
         self.submit();
+        let invalidates_target = self.target_pass.is_some_and(|pass| {
+            pass.is_some_and(|pass| {
+                let pass = &self.passes[pass.0];
+                pass.colors.contains(&id) || pass.resolves.contains(&id) || pass.depth == Some(id)
+            })
+        });
+        if invalidates_target {
+            assert!(!self.pass_active, "cannot resize an active render target");
+            self.target = None;
+            self.target_pass = None;
+        }
         let old = self.texture(id);
         let mut params = old.params;
         params.width = width;
@@ -847,6 +895,11 @@ impl RenderingBackend for WgpuContext {
         &self.passes[id.0].colors
     }
     fn delete_render_pass(&mut self, id: RenderPass) {
+        if self.target_pass == Some(Some(id)) {
+            self.flush_draws();
+            self.target = None;
+            self.target_pass = None;
+        }
         self.passes.remove(id.0);
     }
     fn new_pipeline(
@@ -870,14 +923,16 @@ impl RenderingBackend for WgpuContext {
     fn delete_pipeline(&mut self, id: Pipeline) {
         self.pipelines.remove(id.0);
     }
-    fn new_buffer(&mut self, kind: BufferType, _: BufferUsage, data: BufferSource) -> BufferId {
+    fn new_buffer(&mut self, kind: BufferType, usage: BufferUsage, data: BufferSource) -> BufferId {
         let (bytes, element_size) = buffer_bytes(data);
         let gpu = make_buffer(&self.device, kind, element_size, &bytes);
         BufferId(self.buffers.add(Buffer {
             gpu,
+            gpu_offset: 0,
             bytes,
             element_size,
             kind,
+            usage,
         }))
     }
     fn buffer_update(&mut self, id: BufferId, data: BufferSource) {
@@ -888,12 +943,15 @@ impl RenderingBackend for WgpuContext {
             BufferSource::Slice(data) => data,
             BufferSource::Empty { .. } => panic!("buffer_update expects BufferSource::slice"),
         };
-        // Preserve the immediate API's ordering guarantee. A later upload to
-        // this buffer must not become visible to an earlier deferred draw.
-        self.flush_draws();
         let bytes = unsafe { std::slice::from_raw_parts(data.ptr as *const u8, data.size) };
         let element_size = data.element_size;
         let device = self.device.clone();
+        let stream = self.buffers[id.0].usage == BufferUsage::Stream;
+        if !stream {
+            // Dynamic buffers may be updated once and reused indefinitely.
+            // Keep their dedicated storage and preserve immediate ordering.
+            self.flush_draws();
+        }
         let b = &mut self.buffers[id.0];
         assert!(
             bytes.len() <= b.bytes.len(),
@@ -901,11 +959,6 @@ impl RenderingBackend for WgpuContext {
         );
         assert!(b.kind != BufferType::IndexBuffer || element_size == b.element_size);
         b.bytes[..bytes.len()].copy_from_slice(bytes);
-        // Macroquad updates its stream geometry every frame. Recreating the
-        // wgpu buffer here leaves the old Metal buffers alive until the GPU
-        // finishes with them, which creates a large transient footprint and
-        // makes the allocator retain the freed blocks. Keep the GPU buffer
-        // alive and upload the new contents in place instead.
         // Upload only the slice supplied by the caller. `b.bytes` is the
         // backing allocation/capacity, not the number of elements used by
         // this draw. Uploading it here turns a 26 MiB instance buffer with a
@@ -933,10 +986,58 @@ impl RenderingBackend for WgpuContext {
                 })
             });
             let mut staging_belt = self.staging_belt.borrow_mut();
+            if !stream {
+                b.gpu_offset = 0;
+                let mut staging = staging_belt.write_buffer(
+                    encoder,
+                    &b.gpu,
+                    0,
+                    NonZeroU64::new(upload.len() as u64).expect("buffer upload is non-zero"),
+                );
+                staging.copy_from_slice(&upload);
+                return;
+            }
+
+            // Stream data is replaced before each use. Give every update a
+            // distinct frame-arena range so deferred draws retain a snapshot
+            // without forcing a render-pass break before the next update.
+            const INITIAL_GEOMETRY_CAPACITY: u64 = 4 * 1024 * 1024;
+            let offset = self
+                .geometry_buffer
+                .as_ref()
+                .map_or(0, |arena| align_up(arena.offset, 4));
+            let required = offset + upload.len() as u64;
+            if self
+                .geometry_buffer
+                .as_ref()
+                .is_none_or(|arena| required > arena.capacity)
+            {
+                let capacity = required.max(INITIAL_GEOMETRY_CAPACITY).next_power_of_two();
+                self.geometry_buffer = Some(GeometryBufferArena {
+                    gpu: self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("miniquad frame geometry"),
+                        size: capacity,
+                        usage: wgpu::BufferUsages::VERTEX
+                            | wgpu::BufferUsages::INDEX
+                            | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }),
+                    capacity,
+                    offset: 0,
+                });
+            }
+            let arena = self
+                .geometry_buffer
+                .as_mut()
+                .expect("geometry buffer arena initialized");
+            let offset = align_up(arena.offset, 4);
+            arena.offset = offset + upload.len() as u64;
+            b.gpu = arena.gpu.clone();
+            b.gpu_offset = offset;
             let mut staging = staging_belt.write_buffer(
                 encoder,
-                &b.gpu,
-                0,
+                &arena.gpu,
+                offset,
                 NonZeroU64::new(upload.len() as u64).expect("buffer upload is non-zero"),
             );
             staging.copy_from_slice(&upload);
@@ -950,6 +1051,20 @@ impl RenderingBackend for WgpuContext {
     }
     fn delete_texture(&mut self, id: TextureId) {
         if let TextureIdInner::Managed(id) = id.0 {
+            let texture_id = TextureId(TextureIdInner::Managed(id));
+            let invalidates_target = self.target_pass.is_some_and(|pass| {
+                pass.is_some_and(|pass| {
+                    let pass = &self.passes[pass.0];
+                    pass.colors.contains(&texture_id)
+                        || pass.resolves.contains(&texture_id)
+                        || pass.depth == Some(texture_id)
+                })
+            });
+            if invalidates_target {
+                self.flush_draws();
+                self.target = None;
+                self.target_pass = None;
+            }
             self.bind_groups.borrow_mut().clear();
             self.last_bind_group.get_mut().take();
             // Deletion can happen immediately after commit_frame while higher
@@ -1039,50 +1154,62 @@ impl RenderingBackend for WgpuContext {
         self.begin_pass(None, action);
     }
     fn begin_pass(&mut self, id: Option<RenderPass>, action: PassAction) {
-        assert!(self.target.is_none(), "end the previous render pass first");
-        self.target = if let Some(id) = id {
-            let p = &self.passes[id.0];
-            let first = self.texture(p.colors.first().copied().or(p.depth).unwrap());
-            Some(Target {
-                colors: p
-                    .colors
-                    .iter()
-                    .map(|id| self.texture(*id).view.clone())
-                    .collect(),
-                resolves: p
-                    .resolves
-                    .iter()
-                    .map(|id| self.texture(*id).view.clone())
-                    .collect(),
-                depth: p.depth.map(|id| self.texture(id).view.clone()),
-                key: TargetKey {
+        assert!(!self.pass_active, "end the previous render pass first");
+        // A miniquad pass boundary with Load/Store does not need to become a
+        // native wgpu pass boundary. Keep adjacent draws for the same target
+        // together; this is particularly important for macroquad, which opens
+        // one logical pass per DrawCall.
+        if self.target_pass != Some(id) || self.target.is_none() {
+            self.flush_draws();
+            self.target = if let Some(id) = id {
+                let p = &self.passes[id.0];
+                let first = self.texture(p.colors.first().copied().or(p.depth).unwrap());
+                Some(Target {
                     colors: p
                         .colors
                         .iter()
-                        .map(|id| self.texture(*id).gpu.format())
+                        .map(|id| self.texture(*id).view.clone())
                         .collect(),
-                    depth: p.depth.map(|id| self.texture(id).gpu.format()),
-                    samples: first.params.sample_count.max(1) as _,
-                },
-                width: first.params.width,
-                height: first.params.height,
-            })
-        } else {
-            self.default_target()
-        };
+                    resolves: p
+                        .resolves
+                        .iter()
+                        .map(|id| self.texture(*id).view.clone())
+                        .collect(),
+                    depth: p.depth.map(|id| self.texture(id).view.clone()),
+                    key: TargetKey {
+                        colors: p
+                            .colors
+                            .iter()
+                            .map(|id| self.texture(*id).gpu.format())
+                            .collect(),
+                        depth: p.depth.map(|id| self.texture(id).gpu.format()),
+                        samples: first.params.sample_count.max(1) as _,
+                    },
+                    width: first.params.width,
+                    height: first.params.height,
+                })
+            } else {
+                self.default_target()
+            };
+            self.target_pass = self.target.as_ref().map(|_| id);
+        }
         self.viewport = None;
         self.scissor = None;
         if matches!(action, PassAction::Clear { .. }) {
+            self.flush_draws();
             self.render(&action, |_| {});
         }
+        self.pass_active = true;
     }
     fn end_render_pass(&mut self) {
-        self.flush_draws();
-        self.target = None;
+        assert!(self.pass_active, "end_render_pass without begin_pass");
+        self.pass_active = false;
     }
     fn commit_frame(&mut self) {
-        assert!(self.target.is_none(), "end render pass before commit");
+        assert!(!self.pass_active, "end render pass before commit");
         self.submit();
+        self.target = None;
+        self.target_pass = None;
         let mut state = self.surface.borrow_mut();
         if let Some(frame) = state.frame.take() {
             if let Some(window) = &state.window {
@@ -1094,6 +1221,11 @@ impl RenderingBackend for WgpuContext {
         if let Some(arena) = self.uniform_buffer.borrow_mut().as_mut() {
             // Queue writes are ordered after the previous submit, so the
             // same backing allocation can be reused by the next frame.
+            arena.offset = 0;
+        }
+        if let Some(arena) = self.geometry_buffer.as_mut() {
+            // Queue submissions execute in order, so reusing the same ranges
+            // next frame cannot overtake draws from the preceding frame.
             arena.offset = 0;
         }
     }
@@ -1141,6 +1273,7 @@ impl RenderingBackend for WgpuContext {
             uniform_offset: uniform_offset as u32,
             vertices,
             index: index.gpu.clone(),
+            index_offset: index.gpu_offset,
             index_format: if index.element_size == 4 {
                 wgpu::IndexFormat::Uint32
             } else {

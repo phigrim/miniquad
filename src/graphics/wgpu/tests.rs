@@ -46,6 +46,20 @@ fn geometry(ctx: &mut WgpuContext) -> (BufferId, BufferId) {
     );
     (v, i)
 }
+
+fn stream_geometry(ctx: &mut WgpuContext) -> (BufferId, BufferId) {
+    let v = ctx.new_buffer(
+        BufferType::VertexBuffer,
+        BufferUsage::Stream,
+        BufferSource::empty::<[f32; 2]>(3),
+    );
+    let i = ctx.new_buffer(
+        BufferType::IndexBuffer,
+        BufferUsage::Stream,
+        BufferSource::empty::<u16>(3),
+    );
+    (v, i)
+}
 fn pipeline(ctx: &mut WgpuContext) -> Pipeline {
     let shader = ctx
         .new_shader(
@@ -178,6 +192,44 @@ fn gpu_buffer_updates_do_not_rewrite_prior_draws() {
     let mut pixels = vec![0; 32 * 16 * 4];
     ctx.texture_read_pixels(t, &mut pixels);
     assert!(pixels.chunks_exact(4).all(|p| p == [255, 0, 0, 255]));
+}
+
+#[test]
+#[ignore = "requires a native GPU adapter"]
+fn stream_updates_merge_adjacent_logical_passes() {
+    let mut ctx = gpu();
+    let (t, target_pass) = target(&mut ctx);
+    let pipeline = pipeline(&mut ctx);
+    let (vertices, indices) = stream_geometry(&mut ctx);
+    let bindings = Bindings {
+        vertex_buffers: vec![vertices],
+        index_buffer: indices,
+        images: vec![],
+    };
+
+    for tint in [[1f32, 0., 0., 1.], [0., 1., 0., 1.]] {
+        ctx.begin_pass(Some(target_pass), PassAction::Nothing);
+        ctx.buffer_update(
+            vertices,
+            BufferSource::slice(&[[-1f32, -1.], [3., -1.], [-1., 3.]]),
+        );
+        ctx.buffer_update(indices, BufferSource::slice(&[0u16, 1, 2]));
+        ctx.apply_pipeline(&pipeline);
+        ctx.apply_bindings(&bindings);
+        ctx.apply_uniforms(UniformsSource::table(&tint));
+        ctx.draw(0, 3, 1);
+        ctx.end_render_pass();
+    }
+    ctx.commit_frame();
+
+    // Both miniquad passes target the same texture with Load/Store, so they
+    // should be encoded as one native pass despite intervening stream uploads.
+    assert_eq!(ctx.native_render_passes.get(), 1);
+    let mut pixels = vec![0; 32 * 16 * 4];
+    ctx.texture_read_pixels(t, &mut pixels);
+    assert!(pixels
+        .chunks_exact(4)
+        .all(|pixel| pixel == [0, 255, 0, 255]));
 }
 
 #[test]
