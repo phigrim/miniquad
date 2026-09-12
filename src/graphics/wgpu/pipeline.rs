@@ -105,8 +105,8 @@ impl PipelineState {
             }) || l.input_stride != l.stride as usize
                 || l.rate != 1;
             if !needs_conversion {
-                return ResolvedBuffer {
-                    gpu: b.gpu.clone(),
+                return ResolvedBuffer::Managed {
+                    buffer: ids[i],
                     offset: b.gpu_offset,
                 };
             }
@@ -146,7 +146,7 @@ impl PipelineState {
                     }
                 }
             }
-            ResolvedBuffer {
+            ResolvedBuffer::Owned {
                 gpu: make_buffer(device, BufferType::VertexBuffer, 1, &data),
                 offset: 0,
             }

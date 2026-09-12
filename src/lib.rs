@@ -74,8 +74,14 @@ impl<T> ResourceManager<T> {
         self.resources.remove(&id).unwrap()
     }
 
-    pub(crate) fn get(&self, id: usize) -> Option<&T> {
+    #[cfg(feature = "wgpu")]
+    pub fn get(&self, id: usize) -> Option<&T> {
         self.resources.get(&id)
+    }
+
+    #[cfg(feature = "wgpu")]
+    pub fn clear(&mut self) {
+        self.resources.clear();
     }
 }
 

@@ -146,6 +146,21 @@ fn compressed_format_mapping_covers_wgpu_families_only() {
         None
     );
 }
+
+#[test]
+fn default_pipeline_skips_the_default_depth_attachment() {
+    assert!(!pipeline_needs_depth(&PipelineParams::default()));
+
+    let mut depth_test = PipelineParams {
+        depth_test: Comparison::Less,
+        ..Default::default()
+    };
+    assert!(pipeline_needs_depth(&depth_test));
+    depth_test.depth_test = Comparison::Always;
+    depth_test.depth_write = true;
+    assert!(pipeline_needs_depth(&depth_test));
+}
+
 #[test]
 #[ignore = "requires a native GPU adapter"]
 fn gpu_draws_preserve_uniform_snapshots_and_scissor_origin() {

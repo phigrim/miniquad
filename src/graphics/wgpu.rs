@@ -2,9 +2,14 @@
 use super::*;
 use crate::ResourceManager;
 use ::wgpu;
-#[cfg(test)]
-use std::cell::Cell;
-use std::{borrow::Cow, cell::RefCell, collections::HashMap, num::NonZeroU64, rc::Rc, sync::Arc};
+use std::{
+    borrow::Cow,
+    cell::{Cell, RefCell},
+    collections::HashMap,
+    num::NonZeroU64,
+    rc::Rc,
+    sync::Arc,
+};
 use wgpu::util::DeviceExt;
 mod pipeline;
 mod shader;
@@ -26,22 +31,24 @@ struct GeometryBufferArena {
     gpu: wgpu::Buffer,
     capacity: u64,
     offset: u64,
+    cpu: Vec<u8>,
+    uploaded: Cell<u64>,
 }
 
-pub(super) struct ResolvedBuffer {
-    gpu: wgpu::Buffer,
-    offset: u64,
+pub(super) enum ResolvedBuffer {
+    Managed { buffer: BufferId, offset: u64 },
+    Owned { gpu: wgpu::Buffer, offset: u64 },
 }
 
 /// Fully resolved state for one miniquad draw. Keeping these until
 /// `end_render_pass` lets the wgpu backend encode adjacent miniquad draws into
 /// one native render pass instead of paying render-pass setup per draw.
 struct DrawCommand {
-    pipeline: wgpu::RenderPipeline,
-    bind_group: wgpu::BindGroup,
+    pipeline_id: Pipeline,
+    bind_group: usize,
     uniform_offset: u32,
     vertices: Vec<ResolvedBuffer>,
-    index: wgpu::Buffer,
+    index: BufferId,
     index_offset: u64,
     index_format: wgpu::IndexFormat,
     base: u32,
@@ -56,6 +63,8 @@ struct UniformBufferArena {
     gpu: wgpu::Buffer,
     capacity: u64,
     offset: u64,
+    cpu: Vec<u8>,
+    uploaded: Cell<u64>,
 }
 
 #[derive(Hash, PartialEq, Eq)]
@@ -71,7 +80,7 @@ struct BindGroupKey {
 struct CachedBindGroup {
     shader: usize,
     images: Vec<TextureId>,
-    group: wgpu::BindGroup,
+    group: usize,
 }
 
 struct Pass {
@@ -229,6 +238,13 @@ fn compressed_texture_support(features: wgpu::Features) -> CompressedTextureSupp
     support
 }
 
+fn pipeline_needs_depth(params: &PipelineParams) -> bool {
+    params.depth_write
+        || params.depth_test != Comparison::Always
+        || params.depth_write_offset.is_some()
+        || params.stencil_test.is_some()
+}
+
 /// The wgpu implementation of [`RenderingBackend`].
 /// Created by `window::new_rendering_backend` when `GfxApi::Wgpu` is selected.
 pub struct WgpuContext {
@@ -248,6 +264,10 @@ pub struct WgpuContext {
     encoder: RefCell<Option<wgpu::CommandEncoder>>,
     target: Option<Target>,
     target_pass: Option<Option<RenderPass>>,
+    // The default framebuffer is overwhelmingly used by 2D content. Keep its
+    // depth/stencil attachment lazy, but remember a requested clear so it can
+    // be performed before the first pipeline that actually needs it.
+    pending_default_depth_clear: Option<(Option<f32>, Option<i32>)>,
     pass_active: bool,
     current_pipeline: Option<Pipeline>,
     bindings: Option<Bindings>,
@@ -255,11 +275,13 @@ pub struct WgpuContext {
     packed_uniforms: RefCell<Vec<u8>>,
     uniform_buffer: RefCell<Option<UniformBufferArena>>,
     geometry_buffer: Option<GeometryBufferArena>,
-    bind_groups: RefCell<HashMap<BindGroupKey, wgpu::BindGroup>>,
+    bind_groups: RefCell<HashMap<BindGroupKey, usize>>,
+    bind_group_resources: RefCell<ResourceManager<wgpu::BindGroup>>,
     last_bind_group: RefCell<Option<CachedBindGroup>>,
     staging_belt: RefCell<wgpu::util::StagingBelt>,
     pending_draws: RefCell<Vec<DrawCommand>>,
     vertex_buffer_pool: RefCell<Vec<Vec<ResolvedBuffer>>>,
+    vertex_binding_cache: RefCell<Vec<Option<(BufferId, u64)>>>,
     uniform_alignment: u64,
     viewport: Option<(f32, f32, f32, f32)>,
     scissor: Option<(u32, u32, u32, u32)>,
@@ -358,6 +380,7 @@ impl WgpuContext {
             encoder: RefCell::new(None),
             target: None,
             target_pass: None,
+            pending_default_depth_clear: None,
             pass_active: false,
             current_pipeline: None,
             bindings: None,
@@ -366,10 +389,12 @@ impl WgpuContext {
             uniform_buffer: RefCell::new(None),
             geometry_buffer: None,
             bind_groups: RefCell::new(HashMap::new()),
+            bind_group_resources: RefCell::new(Default::default()),
             last_bind_group: RefCell::new(None),
             staging_belt: RefCell::new(staging_belt),
             pending_draws: RefCell::new(vec![]),
             vertex_buffer_pool: RefCell::new(vec![]),
+            vertex_binding_cache: RefCell::new(vec![]),
             uniform_alignment,
             viewport: None,
             scissor: None,
@@ -408,25 +433,88 @@ impl WgpuContext {
         if commands.is_empty() {
             return;
         }
+        let target = self.target.as_ref().expect("draws require a render target");
+        let mut active_pipeline = None;
+        let mut active_viewport = None;
+        let mut active_scissor = None;
+        let mut active_stencil = None;
+        let mut active_vertices = self.vertex_binding_cache.borrow_mut();
+        active_vertices.clear();
+        let mut active_index: Option<(BufferId, u64, wgpu::IndexFormat)> = None;
+        self.upload_geometry();
+        self.upload_uniforms();
+        let bind_group_resources = self.bind_group_resources.borrow();
         self.render(&PassAction::Nothing, |pass| {
             for command in commands.iter() {
-                pass.set_pipeline(&command.pipeline);
-                pass.set_bind_group(0, &command.bind_group, &[command.uniform_offset]);
-                for (i, buffer) in command.vertices.iter().enumerate() {
-                    pass.set_vertex_buffer(i as u32, buffer.gpu.slice(buffer.offset..));
+                if active_pipeline != Some(command.pipeline_id) {
+                    let pipeline = &self.pipelines[command.pipeline_id.0];
+                    let shader = &self.shaders[pipeline.shader.0];
+                    pass.set_pipeline(&pipeline.get(&self.device, shader, &target.key));
+                    active_pipeline = Some(command.pipeline_id);
                 }
-                pass.set_index_buffer(
-                    command.index.slice(command.index_offset..),
-                    command.index_format,
+                pass.set_bind_group(
+                    0,
+                    &bind_group_resources[command.bind_group],
+                    &[command.uniform_offset],
                 );
-                if let Some((x, y, w, h)) = command.viewport {
-                    pass.set_viewport(x, y, w, h, 0., 1.);
+                if active_vertices.len() < command.vertices.len() {
+                    active_vertices.resize(command.vertices.len(), None);
                 }
-                if let Some((x, y, w, h)) = command.scissor {
-                    pass.set_scissor_rect(x, y, w, h);
+                for (i, buffer) in command.vertices.iter().enumerate() {
+                    let managed = match buffer {
+                        ResolvedBuffer::Managed { buffer, offset } => Some((*buffer, *offset)),
+                        ResolvedBuffer::Owned { .. } => None,
+                    };
+                    if managed.is_some() && active_vertices[i] == managed {
+                        continue;
+                    }
+                    match buffer {
+                        ResolvedBuffer::Managed { buffer, offset } => pass.set_vertex_buffer(
+                            i as u32,
+                            self.buffers[buffer.0].gpu.slice(*offset..),
+                        ),
+                        ResolvedBuffer::Owned { gpu, offset } => {
+                            pass.set_vertex_buffer(i as u32, gpu.slice(*offset..));
+                        }
+                    }
+                    active_vertices[i] = managed;
                 }
-                if let Some(stencil) = command.stencil_reference {
-                    pass.set_stencil_reference(stencil);
+                let index = (command.index, command.index_offset, command.index_format);
+                if active_index != Some(index) {
+                    pass.set_index_buffer(
+                        self.buffers[command.index.0]
+                            .gpu
+                            .slice(command.index_offset..),
+                        command.index_format,
+                    );
+                    active_index = Some(index);
+                }
+                if active_viewport != Some(command.viewport) {
+                    if let Some((x, y, w, h)) = command.viewport {
+                        pass.set_viewport(x, y, w, h, 0., 1.);
+                    } else {
+                        pass.set_viewport(
+                            0.,
+                            0.,
+                            target.width as f32,
+                            target.height as f32,
+                            0.,
+                            1.,
+                        );
+                    }
+                    active_viewport = Some(command.viewport);
+                }
+                if active_scissor != Some(command.scissor) {
+                    if let Some((x, y, w, h)) = command.scissor {
+                        pass.set_scissor_rect(x, y, w, h);
+                    } else {
+                        pass.set_scissor_rect(0, 0, target.width, target.height);
+                    }
+                    active_scissor = Some(command.scissor);
+                }
+                if active_stencil != Some(command.stencil_reference) {
+                    pass.set_stencil_reference(command.stencil_reference.unwrap_or(0));
+                    active_stencil = Some(command.stencil_reference);
                 }
                 pass.draw_indexed(
                     command.base..command.base + command.count,
@@ -524,22 +612,13 @@ impl WgpuContext {
             resolves.push(color);
             color = texture.create_view(&Default::default());
         }
-        let depth = state.default_depth.get_or_insert_with(|| {
-            texture::attachment(
-                device,
-                size.width,
-                size.height,
-                wgpu::TextureFormat::Depth24PlusStencil8,
-                samples,
-            )
-        });
         Some(Target {
             colors: vec![color],
             resolves,
-            depth: Some(depth.create_view(&Default::default())),
+            depth: None,
             key: TargetKey {
                 colors: vec![format],
-                depth: Some(wgpu::TextureFormat::Depth24PlusStencil8),
+                depth: None,
                 samples,
             },
             width: size.width,
@@ -561,6 +640,62 @@ impl WgpuContext {
                 stencil,
             } => (*color, *depth, *stencil),
         };
+        let depth_stencil =
+            target
+                .depth
+                .as_ref()
+                .map(|view| wgpu::RenderPassDepthStencilAttachment {
+                    view,
+                    depth_ops: Some(wgpu::Operations {
+                        load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
+                        store: wgpu::StoreOp::Store,
+                    }),
+                    stencil_ops: if target.key.depth
+                        == Some(wgpu::TextureFormat::Depth24PlusStencil8)
+                    {
+                        Some(wgpu::Operations {
+                            load: stencil
+                                .map_or(wgpu::LoadOp::Load, |s| wgpu::LoadOp::Clear(s as u32)),
+                            store: wgpu::StoreOp::Store,
+                        })
+                    } else {
+                        None
+                    },
+                });
+
+        // The default framebuffer has one color attachment. Keep its
+        // descriptor on the stack; allocating a Vec for every clear and draw
+        // pass is measurable at uncapped frame rates. MRT passes retain the
+        // general heap-backed path below.
+        if target.colors.len() == 1 {
+            let color_attachment = Some(wgpu::RenderPassColorAttachment {
+                view: &target.colors[0],
+                depth_slice: None,
+                resolve_target: target.resolves.first(),
+                ops: wgpu::Operations {
+                    load: color.map_or(wgpu::LoadOp::Load, |(r, g, b, a)| {
+                        wgpu::LoadOp::Clear(wgpu::Color {
+                            r: r as _,
+                            g: g as _,
+                            b: b as _,
+                            a: a as _,
+                        })
+                    }),
+                    store: wgpu::StoreOp::Store,
+                },
+            });
+            let colors = [color_attachment];
+            self.encode(|encoder| {
+                let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                    label: Some("miniquad pass"),
+                    color_attachments: &colors,
+                    depth_stencil_attachment: depth_stencil,
+                    ..Default::default()
+                });
+                f(&mut pass);
+            });
+            return;
+        }
         let colors: Vec<_> = target
             .colors
             .iter()
@@ -584,28 +719,6 @@ impl WgpuContext {
                 })
             })
             .collect();
-        let depth_stencil =
-            target
-                .depth
-                .as_ref()
-                .map(|view| wgpu::RenderPassDepthStencilAttachment {
-                    view,
-                    depth_ops: Some(wgpu::Operations {
-                        load: depth.map_or(wgpu::LoadOp::Load, wgpu::LoadOp::Clear),
-                        store: wgpu::StoreOp::Store,
-                    }),
-                    stencil_ops: if target.key.depth
-                        == Some(wgpu::TextureFormat::Depth24PlusStencil8)
-                    {
-                        Some(wgpu::Operations {
-                            load: stencil
-                                .map_or(wgpu::LoadOp::Load, |s| wgpu::LoadOp::Clear(s as u32)),
-                            store: wgpu::StoreOp::Store,
-                        })
-                    } else {
-                        None
-                    },
-                });
         self.encode(|encoder| {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("miniquad pass"),
@@ -616,36 +729,106 @@ impl WgpuContext {
             f(&mut pass);
         });
     }
-    fn allocate_uniform(&self, bytes: &[u8]) -> (wgpu::Buffer, u64, u64) {
-        const INITIAL_CAPACITY: u64 = 64 * 1024;
-        let binding_size = align_up(bytes.len().max(16) as u64, 16);
-        let mut arena = self.uniform_buffer.borrow_mut();
-        let offset = arena
-            .as_ref()
-            .map_or(0, |arena| align_up(arena.offset, self.uniform_alignment));
-        let required = offset + binding_size;
-        if arena.as_ref().is_none_or(|arena| required > arena.capacity) {
-            let capacity = required.max(INITIAL_CAPACITY).next_power_of_two();
-            let gpu = self.device.create_buffer(&wgpu::BufferDescriptor {
-                label: Some("miniquad frame uniforms"),
-                size: capacity,
-                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
-                mapped_at_creation: false,
-            });
-            *arena = Some(UniformBufferArena {
-                gpu,
-                capacity,
-                offset: 0,
-            });
-            self.bind_groups.borrow_mut().clear();
-            self.last_bind_group.borrow_mut().take();
-        }
-        let arena_ref = arena.as_mut().expect("uniform buffer arena initialized");
-        let offset = align_up(arena_ref.offset, self.uniform_alignment);
-        let gpu = arena_ref.gpu.clone();
-        arena_ref.offset = offset + binding_size;
-        drop(arena);
+    fn clear_bind_groups(&self) {
+        self.bind_groups.borrow_mut().clear();
+        self.bind_group_resources.borrow_mut().clear();
+        self.last_bind_group.borrow_mut().take();
+    }
 
+    /// Attach the window depth/stencil surface only when a pipeline needs it.
+    /// This removes a full-screen depth load/store and lets wgpu create a
+    /// simpler render pipeline for the common 2D case.
+    fn ensure_default_depth(&mut self) {
+        if self.target_pass != Some(None)
+            || self
+                .target
+                .as_ref()
+                .is_none_or(|target| target.depth.is_some())
+        {
+            return;
+        }
+        self.flush_draws();
+        let (width, height, samples) = {
+            let target = self.target.as_ref().expect("default target exists");
+            (target.width, target.height, target.key.samples)
+        };
+        let view = {
+            let mut state = self.surface.borrow_mut();
+            let depth = state.default_depth.get_or_insert_with(|| {
+                texture::attachment(
+                    &self.device,
+                    width,
+                    height,
+                    wgpu::TextureFormat::Depth24PlusStencil8,
+                    samples,
+                )
+            });
+            depth.create_view(&Default::default())
+        };
+        let target = self.target.as_mut().expect("default target exists");
+        target.depth = Some(view);
+        target.key.depth = Some(wgpu::TextureFormat::Depth24PlusStencil8);
+
+        if let Some((depth, stencil)) = self.pending_default_depth_clear.take() {
+            self.render(
+                &PassAction::Clear {
+                    color: None,
+                    depth,
+                    stencil,
+                },
+                |_| {},
+            );
+        }
+    }
+
+    fn render_clear(
+        &mut self,
+        color: Option<(f32, f32, f32, f32)>,
+        depth: Option<f32>,
+        stencil: Option<i32>,
+    ) {
+        let default_without_depth = self.target_pass == Some(None)
+            && self
+                .target
+                .as_ref()
+                .is_some_and(|target| target.depth.is_none());
+        if default_without_depth {
+            if depth.is_some() || stencil.is_some() {
+                self.pending_default_depth_clear = Some((depth, stencil));
+            }
+            self.render(
+                &PassAction::Clear {
+                    color,
+                    depth: None,
+                    stencil: None,
+                },
+                |_| {},
+            );
+        } else {
+            self.pending_default_depth_clear = None;
+            self.render(
+                &PassAction::Clear {
+                    color,
+                    depth,
+                    stencil,
+                },
+                |_| {},
+            );
+        }
+    }
+
+    /// Upload the contiguous uniform prefix once before encoding the native
+    /// render pass. Individual draws only reserve/copy into the CPU arena;
+    /// emitting one transfer here avoids a staging copy command per draw.
+    fn upload_uniforms(&self) {
+        let arena = self.uniform_buffer.borrow();
+        let Some(arena) = arena.as_ref() else {
+            return;
+        };
+        let start = arena.uploaded.get();
+        if arena.offset <= start {
+            return;
+        }
         let mut encoder = self.encoder.borrow_mut();
         let encoder = encoder.get_or_insert_with(|| {
             self.device
@@ -656,17 +839,83 @@ impl WgpuContext {
         let mut staging_belt = self.staging_belt.borrow_mut();
         let mut staging = staging_belt.write_buffer(
             encoder,
-            &gpu,
-            offset,
-            NonZeroU64::new(binding_size).expect("uniform size is non-zero"),
+            &arena.gpu,
+            start,
+            NonZeroU64::new(arena.offset - start).expect("uniform upload is non-zero"),
         );
-        if bytes.is_empty() {
-            staging.copy_from_slice(&[0; 16]);
-        } else {
-            staging.copy_from_slice(bytes);
+        staging.copy_from_slice(&arena.cpu[start as usize..arena.offset as usize]);
+        arena.uploaded.set(arena.offset);
+    }
+
+    /// Stream vertex/index updates share one frame arena. Upload its used
+    /// prefix once before the render pass instead of issuing a copy for every
+    /// logical draw's vertex and index update.
+    fn upload_geometry(&self) {
+        let Some(arena) = self.geometry_buffer.as_ref() else {
+            return;
+        };
+        let start = arena.uploaded.get();
+        if arena.offset <= start {
+            return;
         }
-        drop(staging);
-        (gpu, offset, binding_size)
+        let mut encoder = self.encoder.borrow_mut();
+        let encoder = encoder.get_or_insert_with(|| {
+            self.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("miniquad frame"),
+                })
+        });
+        let mut staging_belt = self.staging_belt.borrow_mut();
+        let mut staging = staging_belt.write_buffer(
+            encoder,
+            &arena.gpu,
+            start,
+            NonZeroU64::new(arena.offset - start).expect("geometry upload is non-zero"),
+        );
+        staging.copy_from_slice(&arena.cpu[start as usize..arena.offset as usize]);
+        arena.uploaded.set(arena.offset);
+    }
+
+    fn allocate_uniform(&self, bytes: &[u8]) -> (u64, u64) {
+        // Keep normal frames in one arena so a full arena does not force a
+        // render-pass split and bind-group rebuild in the middle of a frame.
+        const INITIAL_CAPACITY: u64 = 256 * 1024;
+        let binding_size = align_up(bytes.len().max(16) as u64, 16);
+        let needs_new_arena = {
+            let arena = self.uniform_buffer.borrow();
+            let offset = arena
+                .as_ref()
+                .map_or(0, |arena| align_up(arena.offset, self.uniform_alignment));
+            arena
+                .as_ref()
+                .is_none_or(|arena| offset + binding_size > arena.capacity)
+        };
+        if needs_new_arena {
+            self.flush_draws();
+            let capacity = binding_size.max(INITIAL_CAPACITY).next_power_of_two();
+            let gpu = self.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("miniquad frame uniforms"),
+                size: capacity,
+                usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+            *self.uniform_buffer.borrow_mut() = Some(UniformBufferArena {
+                gpu,
+                capacity,
+                offset: 0,
+                cpu: Vec::with_capacity(capacity as usize),
+                uploaded: Cell::new(0),
+            });
+            self.clear_bind_groups();
+        }
+        let mut arena = self.uniform_buffer.borrow_mut();
+        let arena_ref = arena.as_mut().expect("uniform buffer arena initialized");
+        let offset = align_up(arena_ref.offset, self.uniform_alignment);
+        arena_ref.offset = offset + binding_size;
+        let end = (offset + binding_size) as usize;
+        arena_ref.cpu.resize(end, 0);
+        arena_ref.cpu[offset as usize..offset as usize + bytes.len()].copy_from_slice(bytes);
+        (offset, binding_size)
     }
 
     fn bind_group(
@@ -674,14 +923,13 @@ impl WgpuContext {
         shader_id: usize,
         shader: &Shader,
         bindings: &Bindings,
-        uniform: &wgpu::Buffer,
         uniform_size: u64,
-    ) -> wgpu::BindGroup {
+    ) -> usize {
         {
             let last = self.last_bind_group.borrow();
             if let Some(cached) = last.as_ref() {
                 if cached.shader == shader_id && cached.images == bindings.images {
-                    return cached.group.clone();
+                    return cached.group;
                 }
             }
         }
@@ -689,19 +937,23 @@ impl WgpuContext {
             shader: shader_id,
             images: bindings.images.clone(),
         };
-        if let Some(group) = self.bind_groups.borrow().get(&key).cloned() {
+        if let Some(&group) = self.bind_groups.borrow().get(&key) {
             *self.last_bind_group.borrow_mut() = Some(CachedBindGroup {
                 shader: shader_id,
                 images: bindings.images.clone(),
-                group: group.clone(),
+                group,
             });
             return group;
         }
 
+        let uniform_arena = self.uniform_buffer.borrow();
         let mut entries = vec![wgpu::BindGroupEntry {
             binding: 0,
             resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
-                buffer: uniform,
+                buffer: &uniform_arena
+                    .as_ref()
+                    .expect("uniform buffer arena initialized")
+                    .gpu,
                 offset: 0,
                 size: Some(NonZeroU64::new(uniform_size).expect("uniform size is non-zero")),
             }),
@@ -722,11 +974,12 @@ impl WgpuContext {
             layout: &shader.layout,
             entries: &entries,
         });
-        self.bind_groups.borrow_mut().insert(key, group.clone());
+        let group = self.bind_group_resources.borrow_mut().add(group);
+        self.bind_groups.borrow_mut().insert(key, group);
         *self.last_bind_group.borrow_mut() = Some(CachedBindGroup {
             shader: shader_id,
             images: bindings.images.clone(),
-            group: group.clone(),
+            group,
         });
         group
     }
@@ -817,6 +1070,8 @@ impl RenderingBackend for WgpuContext {
         panic!("wgpu textures have no OpenGL or Metal raw id")
     }
     fn texture_set_min_filter(&mut self, id: TextureId, filter: FilterMode, mip: MipmapFilterMode) {
+        self.flush_draws();
+        self.clear_bind_groups();
         let device = self.device.clone();
         let t = self.texture_mut(id);
         t.params.min_filter = filter;
@@ -824,12 +1079,16 @@ impl RenderingBackend for WgpuContext {
         t.update_sampler(&device);
     }
     fn texture_set_mag_filter(&mut self, id: TextureId, filter: FilterMode) {
+        self.flush_draws();
+        self.clear_bind_groups();
         let device = self.device.clone();
         let t = self.texture_mut(id);
         t.params.mag_filter = filter;
         t.update_sampler(&device);
     }
     fn texture_set_wrap(&mut self, id: TextureId, x: TextureWrap, y: TextureWrap) {
+        self.flush_draws();
+        self.clear_bind_groups();
         let device = self.device.clone();
         let t = self.texture_mut(id);
         t.params.wrap = x;
@@ -841,6 +1100,7 @@ impl RenderingBackend for WgpuContext {
     }
     fn texture_resize(&mut self, id: TextureId, width: u32, height: u32, bytes: Option<&[u8]>) {
         self.submit();
+        self.clear_bind_groups();
         let invalidates_target = self.target_pass.is_some_and(|pass| {
             pass.is_some_and(|pass| {
                 let pass = &self.passes[pass.0];
@@ -918,9 +1178,13 @@ impl RenderingBackend for WgpuContext {
         )))
     }
     fn apply_pipeline(&mut self, id: &Pipeline) {
+        if pipeline_needs_depth(&self.pipelines[id.0].params) {
+            self.ensure_default_depth();
+        }
         self.current_pipeline = Some(*id);
     }
     fn delete_pipeline(&mut self, id: Pipeline) {
+        self.flush_draws();
         self.pipelines.remove(id.0);
     }
     fn new_buffer(&mut self, kind: BufferType, usage: BufferUsage, data: BufferSource) -> BufferId {
@@ -947,6 +1211,30 @@ impl RenderingBackend for WgpuContext {
         let element_size = data.element_size;
         let device = self.device.clone();
         let stream = self.buffers[id.0].usage == BufferUsage::Stream;
+        if stream && !bytes.is_empty() {
+            let buffer = &self.buffers[id.0];
+            let upload_len = if buffer.kind == BufferType::IndexBuffer && buffer.element_size == 1 {
+                bytes.len() * 2
+            } else {
+                bytes.len()
+            };
+            let upload_len = (upload_len + 3) & !3;
+            let required = self
+                .geometry_buffer
+                .as_ref()
+                .map_or(upload_len as u64, |arena| {
+                    align_up(arena.offset, 4) + upload_len as u64
+                });
+            if self
+                .geometry_buffer
+                .as_ref()
+                .is_some_and(|arena| required > arena.capacity)
+            {
+                // Commands retain BufferId + byte offset. If an arena needs
+                // replacement, finish commands against the old arena first.
+                self.flush_draws();
+            }
+        }
         if !stream {
             // Dynamic buffers may be updated once and reused indefinitely.
             // Keep their dedicated storage and preserve immediate ordering.
@@ -979,14 +1267,14 @@ impl RenderingBackend for WgpuContext {
                 padded.resize(aligned_len, 0);
                 Cow::Owned(padded)
             };
-            let mut encoder = self.encoder.borrow_mut();
-            let encoder = encoder.get_or_insert_with(|| {
-                device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-                    label: Some("miniquad frame"),
-                })
-            });
-            let mut staging_belt = self.staging_belt.borrow_mut();
             if !stream {
+                let mut encoder = self.encoder.borrow_mut();
+                let encoder = encoder.get_or_insert_with(|| {
+                    device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                        label: Some("miniquad frame"),
+                    })
+                });
+                let mut staging_belt = self.staging_belt.borrow_mut();
                 b.gpu_offset = 0;
                 let mut staging = staging_belt.write_buffer(
                     encoder,
@@ -1024,6 +1312,8 @@ impl RenderingBackend for WgpuContext {
                     }),
                     capacity,
                     offset: 0,
+                    cpu: Vec::with_capacity(capacity as usize),
+                    uploaded: Cell::new(0),
                 });
             }
             let arena = self
@@ -1032,25 +1322,23 @@ impl RenderingBackend for WgpuContext {
                 .expect("geometry buffer arena initialized");
             let offset = align_up(arena.offset, 4);
             arena.offset = offset + upload.len() as u64;
+            let end = arena.offset as usize;
+            arena.cpu.resize(end, 0);
+            arena.cpu[offset as usize..end].copy_from_slice(&upload);
             b.gpu = arena.gpu.clone();
             b.gpu_offset = offset;
-            let mut staging = staging_belt.write_buffer(
-                encoder,
-                &arena.gpu,
-                offset,
-                NonZeroU64::new(upload.len() as u64).expect("buffer upload is non-zero"),
-            );
-            staging.copy_from_slice(&upload);
         }
     }
     fn buffer_size(&mut self, id: BufferId) -> usize {
         self.buffers[id.0].bytes.len()
     }
     fn delete_buffer(&mut self, id: BufferId) {
+        self.flush_draws();
         self.buffers.remove(id.0);
     }
     fn delete_texture(&mut self, id: TextureId) {
         if let TextureIdInner::Managed(id) = id.0 {
+            self.flush_draws();
             let texture_id = TextureId(TextureIdInner::Managed(id));
             let invalidates_target = self.target_pass.is_some_and(|pass| {
                 pass.is_some_and(|pass| {
@@ -1061,12 +1349,10 @@ impl RenderingBackend for WgpuContext {
                 })
             });
             if invalidates_target {
-                self.flush_draws();
                 self.target = None;
                 self.target_pass = None;
             }
-            self.bind_groups.borrow_mut().clear();
-            self.last_bind_group.get_mut().take();
+            self.clear_bind_groups();
             // Deletion can happen immediately after commit_frame while higher
             // layers still have a cached raw TextureId to flush. Resource ids
             // are monotonic, so retaining the old value cannot alias a new
@@ -1078,8 +1364,8 @@ impl RenderingBackend for WgpuContext {
         }
     }
     fn delete_shader(&mut self, id: ShaderId) {
-        self.bind_groups.borrow_mut().clear();
-        self.last_bind_group.get_mut().take();
+        self.flush_draws();
+        self.clear_bind_groups();
         self.shaders.remove(id.0);
     }
     fn apply_viewport(&mut self, x: i32, y: i32, w: i32, h: i32) {
@@ -1141,14 +1427,7 @@ impl RenderingBackend for WgpuContext {
         stencil: Option<i32>,
     ) {
         self.flush_draws();
-        self.render(
-            &PassAction::Clear {
-                color,
-                depth,
-                stencil,
-            },
-            |_| {},
-        );
+        self.render_clear(color, depth, stencil);
     }
     fn begin_default_pass(&mut self, action: PassAction) {
         self.begin_pass(None, action);
@@ -1161,6 +1440,7 @@ impl RenderingBackend for WgpuContext {
         // one logical pass per DrawCall.
         if self.target_pass != Some(id) || self.target.is_none() {
             self.flush_draws();
+            self.pending_default_depth_clear = None;
             self.target = if let Some(id) = id {
                 let p = &self.passes[id.0];
                 let first = self.texture(p.colors.first().copied().or(p.depth).unwrap());
@@ -1193,11 +1473,23 @@ impl RenderingBackend for WgpuContext {
             };
             self.target_pass = self.target.as_ref().map(|_| id);
         }
+        if self.target_pass == Some(None)
+            && self
+                .current_pipeline
+                .is_some_and(|pipeline| pipeline_needs_depth(&self.pipelines[pipeline.0].params))
+        {
+            self.ensure_default_depth();
+        }
         self.viewport = None;
         self.scissor = None;
-        if matches!(action, PassAction::Clear { .. }) {
+        if let PassAction::Clear {
+            color,
+            depth,
+            stencil,
+        } = action
+        {
             self.flush_draws();
-            self.render(&action, |_| {});
+            self.render_clear(color, depth, stencil);
         }
         self.pass_active = true;
     }
@@ -1210,6 +1502,7 @@ impl RenderingBackend for WgpuContext {
         self.submit();
         self.target = None;
         self.target_pass = None;
+        self.pending_default_depth_clear = None;
         let mut state = self.surface.borrow_mut();
         if let Some(frame) = state.frame.take() {
             if let Some(window) = &state.window {
@@ -1222,11 +1515,15 @@ impl RenderingBackend for WgpuContext {
             // Queue writes are ordered after the previous submit, so the
             // same backing allocation can be reused by the next frame.
             arena.offset = 0;
+            arena.uploaded.set(0);
+            arena.cpu.clear();
         }
         if let Some(arena) = self.geometry_buffer.as_mut() {
             // Queue submissions execute in order, so reusing the same ranges
             // next frame cannot overtake draws from the preceding frame.
             arena.offset = 0;
+            arena.uploaded.set(0);
+            arena.cpu.clear();
         }
     }
     fn draw(&self, base: i32, count: i32, instances: i32) {
@@ -1248,11 +1545,9 @@ impl RenderingBackend for WgpuContext {
         shader
             .uniforms
             .pack_into(&self.uniforms, &mut packed_uniform);
-        let (uniform, uniform_offset, uniform_size) = self.allocate_uniform(&packed_uniform);
+        let (uniform_offset, uniform_size) = self.allocate_uniform(&packed_uniform);
         drop(packed_uniform);
-        let group = self.bind_group(p.shader.0, shader, bindings, &uniform, uniform_size);
-        let target = self.target.as_ref().unwrap();
-        let pipeline = p.get(&self.device, shader, &target.key);
+        let group = self.bind_group(p.shader.0, shader, bindings, uniform_size);
         let mut vertices = self
             .vertex_buffer_pool
             .borrow_mut()
@@ -1268,11 +1563,11 @@ impl RenderingBackend for WgpuContext {
         assert!((base as usize + count as usize) * index.element_size <= index.bytes.len());
         assert!(uniform_offset <= u64::from(u32::MAX));
         self.pending_draws.borrow_mut().push(DrawCommand {
-            pipeline,
+            pipeline_id: self.current_pipeline.expect("pipeline checked above"),
             bind_group: group,
             uniform_offset: uniform_offset as u32,
             vertices,
-            index: index.gpu.clone(),
+            index: bindings.index_buffer,
             index_offset: index.gpu_offset,
             index_format: if index.element_size == 4 {
                 wgpu::IndexFormat::Uint32
