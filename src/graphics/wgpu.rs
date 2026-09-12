@@ -235,6 +235,7 @@ pub struct WgpuContext {
     last_bind_group: RefCell<Option<CachedBindGroup>>,
     staging_belt: RefCell<wgpu::util::StagingBelt>,
     pending_draws: RefCell<Vec<DrawCommand>>,
+    vertex_buffer_pool: RefCell<Vec<Vec<wgpu::Buffer>>>,
     uniform_alignment: u64,
     viewport: Option<(f32, f32, f32, f32)>,
     scissor: Option<(u32, u32, u32, u32)>,
@@ -339,6 +340,7 @@ impl WgpuContext {
             last_bind_group: RefCell::new(None),
             staging_belt: RefCell::new(staging_belt),
             pending_draws: RefCell::new(vec![]),
+            vertex_buffer_pool: RefCell::new(vec![]),
             uniform_alignment,
             viewport: None,
             scissor: None,
@@ -371,12 +373,12 @@ impl WgpuContext {
     /// retaining resolved draw state is the only way to preserve miniquad's
     /// immediate API while still submitting one native render pass.
     fn flush_draws(&self) {
-        let commands = std::mem::take(&mut *self.pending_draws.borrow_mut());
+        let mut commands = self.pending_draws.borrow_mut();
         if commands.is_empty() {
             return;
         }
         self.render(&PassAction::Nothing, |pass| {
-            for command in &commands {
+            for command in commands.iter() {
                 pass.set_pipeline(&command.pipeline);
                 pass.set_bind_group(0, &command.bind_group, &[command.uniform_offset]);
                 for (i, buffer) in command.vertices.iter().enumerate() {
@@ -399,6 +401,18 @@ impl WgpuContext {
                 );
             }
         });
+        // Keep the allocation for the next logical pass. Macroquad opens and
+        // closes several small passes per frame, so `mem::take` here turned
+        // every pass into a fresh allocation on the CPU hot path.
+        // Each DrawCommand owns a small Vec of retained vertex-buffer handles.
+        // Recycle those Vec allocations too, while clearing their handles so
+        // deleted GPU resources are not kept alive by the pool.
+        let mut vertex_buffer_pool = self.vertex_buffer_pool.borrow_mut();
+        for command in commands.drain(..) {
+            let mut vertices = command.vertices;
+            vertices.clear();
+            vertex_buffer_pool.push(vertices);
+        }
     }
     fn texture(&self, id: TextureId) -> &Texture {
         match id.0 {
@@ -1107,7 +1121,17 @@ impl RenderingBackend for WgpuContext {
         let group = self.bind_group(p.shader.0, shader, bindings, &uniform, uniform_size);
         let target = self.target.as_ref().unwrap();
         let pipeline = p.get(&self.device, shader, &target.key);
-        let vertices = p.vertex_buffers(&self.device, &self.buffers, &bindings.vertex_buffers);
+        let mut vertices = self
+            .vertex_buffer_pool
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default();
+        p.vertex_buffers(
+            &self.device,
+            &self.buffers,
+            &bindings.vertex_buffers,
+            &mut vertices,
+        );
         let index = &self.buffers[bindings.index_buffer.0];
         assert!((base as usize + count as usize) * index.element_size <= index.bytes.len());
         assert!(uniform_offset <= u64::from(u32::MAX));

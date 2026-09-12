@@ -19,6 +19,19 @@ pub(super) struct UniformLayout {
     copies: Vec<(usize, usize, usize)>,
 }
 impl UniformLayout {
+    fn push_copy(&mut self, src: usize, dst: usize, len: usize) {
+        // Consecutive vec4 arrays (the common large-uniform case) have no
+        // std140/WGSL padding between elements. Merge them so packing a
+        // 128-element array is one memcpy rather than 128 tiny memcpys.
+        if let Some((last_src, last_dst, last_len)) = self.copies.last_mut() {
+            if *last_src + *last_len == src && *last_dst + *last_len == dst {
+                *last_len += len;
+                return;
+            }
+        }
+        self.copies.push((src, dst, len));
+    }
+
     pub fn new(meta: &ShaderMeta) -> Self {
         let mut out = Self {
             size: 0,
@@ -43,7 +56,7 @@ impl UniformLayout {
                 size
             };
             for _ in 0..u.array_count {
-                out.copies.push((out.packed_size, out.size, size));
+                out.push_copy(out.packed_size, out.size, size);
                 out.packed_size += size;
                 out.size += stride;
             }
@@ -275,8 +288,19 @@ fn translate(
 }
 #[cfg(test)]
 mod tests {
-    use super::{declarations, tokens, translate};
-    use crate::graphics::{ShaderMeta, UniformBlockLayout};
+    use super::{declarations, tokens, translate, UniformLayout};
+    use crate::graphics::{ShaderMeta, UniformBlockLayout, UniformDesc, UniformType};
+
+    #[test]
+    fn uniform_copy_plan_coalesces_contiguous_array_elements() {
+        let layout = UniformLayout::new(&ShaderMeta {
+            images: vec![],
+            uniforms: UniformBlockLayout {
+                uniforms: vec![UniformDesc::new("lines", UniformType::Float4).array(128)],
+            },
+        });
+        assert_eq!(layout.copies, vec![(0, 0, 128 * 16)]);
+    }
 
     #[test]
     fn tokens_keep_scientific_float_literals_intact() {
@@ -493,11 +517,11 @@ fn compile_wgsl(
                     _ => size,
                 };
                 for i in 0..u.array_count {
-                    uniforms.copies.push((
+                    uniforms.push_copy(
                         uniforms.packed_size + i * size,
                         member.offset as usize + i * stride,
                         size,
-                    ));
+                    );
                 }
             }
             uniforms.packed_size += size * u.array_count;

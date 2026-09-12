@@ -87,70 +87,64 @@ impl PipelineState {
         device: &wgpu::Device,
         buffers: &ResourceManager<Buffer>,
         ids: &[BufferId],
-    ) -> Vec<wgpu::Buffer> {
-        self.layouts
-            .iter()
-            .enumerate()
-            .map(|(i, l)| {
-                let b = &buffers[ids[i].0];
-                assert_eq!(b.kind, BufferType::VertexBuffer);
-                let needs_conversion = l.conversions.iter().any(|(_, f, _)| {
-                    !matches!(
-                        f,
-                        VertexFormat::Float1
+        result: &mut Vec<wgpu::Buffer>,
+    ) {
+        result.clear();
+        result.extend(self.layouts.iter().enumerate().map(|(i, l)| {
+            let b = &buffers[ids[i].0];
+            assert_eq!(b.kind, BufferType::VertexBuffer);
+            let needs_conversion = l.conversions.iter().any(|(_, f, _)| {
+                !matches!(
+                    f,
+                    VertexFormat::Float1
+                        | VertexFormat::Float2
+                        | VertexFormat::Float3
+                        | VertexFormat::Float4
+                        | VertexFormat::Mat4
+                )
+            }) || l.input_stride != l.stride as usize
+                || l.rate != 1;
+            if !needs_conversion {
+                return b.gpu.clone();
+            }
+            let mut data = vec![];
+            for v in b.bytes.chunks_exact(l.input_stride) {
+                let start = data.len();
+                for &(offset, f, as_float) in &l.conversions {
+                    let component_size = f.size_bytes() as usize / f.components() as usize;
+                    for c in 0..f.components() as usize {
+                        let pos = offset + c * component_size;
+                        match f {
+                            VertexFormat::Float1
                             | VertexFormat::Float2
                             | VertexFormat::Float3
                             | VertexFormat::Float4
-                            | VertexFormat::Mat4
-                    )
-                }) || l.input_stride != l.stride as usize
-                    || l.rate != 1;
-                if !needs_conversion {
-                    return b.gpu.clone();
-                }
-                let mut data = vec![];
-                for v in b.bytes.chunks_exact(l.input_stride) {
-                    let start = data.len();
-                    for &(offset, f, as_float) in &l.conversions {
-                        let component_size = f.size_bytes() as usize / f.components() as usize;
-                        for c in 0..f.components() as usize {
-                            let pos = offset + c * component_size;
-                            match f {
-                                VertexFormat::Float1
-                                | VertexFormat::Float2
-                                | VertexFormat::Float3
-                                | VertexFormat::Float4
-                                | VertexFormat::Mat4 => data.extend_from_slice(&v[pos..pos + 4]),
-                                _ => {
-                                    let value = match component_size {
-                                        1 => v[pos] as u32,
-                                        2 => {
-                                            u16::from_ne_bytes(v[pos..pos + 2].try_into().unwrap())
-                                                as u32
-                                        }
-                                        _ => {
-                                            u32::from_ne_bytes(v[pos..pos + 4].try_into().unwrap())
-                                        }
-                                    };
-                                    if as_float {
-                                        data.extend_from_slice(&(value as f32).to_ne_bytes());
-                                    } else {
-                                        data.extend_from_slice(&value.to_ne_bytes());
-                                    }
+                            | VertexFormat::Mat4 => data.extend_from_slice(&v[pos..pos + 4]),
+                            _ => {
+                                let value = match component_size {
+                                    1 => v[pos] as u32,
+                                    2 => u16::from_ne_bytes(v[pos..pos + 2].try_into().unwrap())
+                                        as u32,
+                                    _ => u32::from_ne_bytes(v[pos..pos + 4].try_into().unwrap()),
+                                };
+                                if as_float {
+                                    data.extend_from_slice(&(value as f32).to_ne_bytes());
+                                } else {
+                                    data.extend_from_slice(&value.to_ne_bytes());
                                 }
                             }
                         }
                     }
-                    let end = data.len();
-                    if l.step == wgpu::VertexStepMode::Instance {
-                        for _ in 1..l.rate {
-                            data.extend_from_within(start..end);
-                        }
+                }
+                let end = data.len();
+                if l.step == wgpu::VertexStepMode::Instance {
+                    for _ in 1..l.rate {
+                        data.extend_from_within(start..end);
                     }
                 }
-                make_buffer(device, BufferType::VertexBuffer, 1, &data)
-            })
-            .collect()
+            }
+            make_buffer(device, BufferType::VertexBuffer, 1, &data)
+        }))
     }
     pub fn get(
         &self,
@@ -158,6 +152,12 @@ impl PipelineState {
         shader: &Shader,
         key: &TargetKey,
     ) -> wgpu::RenderPipeline {
+        // Avoid cloning TargetKey on a cache hit. TargetKey owns format Vecs,
+        // and this lookup runs for every draw; `entry(key.clone())` therefore
+        // caused a heap allocation even after the pipeline was warm.
+        if let Some(pipeline) = self.cache.borrow().get(key).cloned() {
+            return pipeline;
+        }
         self.cache
             .borrow_mut()
             .entry(key.clone())
