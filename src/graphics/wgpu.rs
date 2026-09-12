@@ -244,7 +244,8 @@ impl WgpuContext {
         window: Arc<winit::window::Window>,
         conf: &crate::conf::Conf,
     ) -> Result<(Self, SurfaceController), SurfaceInitError> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle());
+        let instance =
+            wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance
             .create_surface(window.clone())
             .map_err(|error| SurfaceInitError::Surface(error.to_string()))?;
