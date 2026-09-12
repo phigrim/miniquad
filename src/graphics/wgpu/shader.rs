@@ -102,9 +102,17 @@ fn tokens(source: &str) -> Vec<String> {
                 out.push(format!("\n{}\n", line));
             }
         } else if chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.' {
+            let number_literal = chars[i].is_ascii_digit() || chars[i] == '.';
             i += 1;
             while i < chars.len()
-                && (chars[i].is_alphanumeric() || chars[i] == '_' || chars[i] == '.')
+                && (chars[i].is_alphanumeric()
+                    || chars[i] == '_'
+                    || chars[i] == '.'
+                    || (number_literal
+                        && matches!(chars[i], '+' | '-')
+                        && chars
+                            .get(i.wrapping_sub(1))
+                            .is_some_and(|previous| matches!(previous, 'e' | 'E'))))
             {
                 i += 1;
             }
@@ -135,10 +143,10 @@ fn tokens(source: &str) -> Vec<String> {
     }
     out
 }
-fn declarations(tokens: &[String], qualifier: &str) -> BTreeMap<String, (String, u32)> {
+fn declarations(tokens: &[String], qualifiers: &[&str]) -> BTreeMap<String, (String, u32)> {
     let mut names = BTreeMap::new();
     for i in 0..tokens.len() {
-        if tokens[i] == qualifier {
+        if qualifiers.iter().any(|qualifier| tokens[i] == *qualifier) {
             let mut j = i + 1;
             while tokens
                 .get(j)
@@ -164,7 +172,11 @@ fn translate(
     meta: &ShaderMeta,
     varying: &BTreeMap<String, (String, u32)>,
 ) -> (String, BTreeMap<String, u32>) {
-    let attrs = declarations(source, "attribute");
+    let attrs = if vertex {
+        declarations(source, &["attribute", "in"])
+    } else {
+        BTreeMap::new()
+    };
     let mut out = String::from("#version 450\n");
     if !meta.uniforms.uniforms.is_empty() {
         out.push_str("layout(set=0,binding=0,std140) uniform MiniquadUniforms {\n");
@@ -213,26 +225,25 @@ fn translate(
             i += 1;
             continue;
         }
-        if t == "attribute" || t == "varying" {
+        if matches!(t.as_str(), "attribute" | "varying" | "in" | "out") {
             let mut j = i + 1;
             while matches!(source[j].as_str(), "lowp" | "mediump" | "highp") {
                 j += 1;
             }
             let name = &source[j + 1];
-            let loc = if t == "attribute" {
-                attrs[name].1
-            } else {
-                varying[name].1
+            let (loc, direction) = match t.as_str() {
+                "attribute" => (attrs[name].1, "in"),
+                "varying" => (varying[name].1, if vertex { "out" } else { "in" }),
+                "in" if vertex => (attrs[name].1, "in"),
+                "in" => (varying[name].1, "in"),
+                // Modern GLSL fragment outputs are the color attachment at
+                // location zero. They are not part of the inter-stage varying
+                // interface and therefore do not appear in `varying`.
+                "out" if !vertex => (0, "out"),
+                "out" => (varying[name].1, "out"),
+                _ => unreachable!(),
             };
-            out.push_str(&format!(
-                "layout(location={}) {} ",
-                loc,
-                if t == "attribute" || !vertex {
-                    "in"
-                } else {
-                    "out"
-                }
-            ));
+            out.push_str(&format!("layout(location={}) {} ", loc, direction));
             i += 1;
             continue;
         }
@@ -260,6 +271,49 @@ fn translate(
             .collect(),
     )
 }
+#[cfg(test)]
+mod tests {
+    use super::{declarations, tokens, translate};
+    use crate::graphics::{ShaderMeta, UniformBlockLayout};
+
+    #[test]
+    fn tokens_keep_scientific_float_literals_intact() {
+        assert_eq!(
+            tokens("float a = 1e-6; float b = .5E+2;"),
+            ["float", "a", "=", "1e-6", ";", "float", "b", "=", ".5E+2", ";"]
+        );
+    }
+
+    #[test]
+    fn translate_assigns_locations_to_modern_glsl_interfaces() {
+        let vertex = tokens(
+            "in vec2 position; out vec2 uv; void main() { gl_Position = vec4(position, 0., 1.); uv = position; }",
+        );
+        let fragment = tokens(
+            "in vec2 uv; out vec4 frag_color; void main() { frag_color = vec4(uv, 0., 1.); }",
+        );
+        let mut varying = declarations(&vertex, &["out"]);
+        for (name, ty) in declarations(&fragment, &["in"]) {
+            varying.entry(name).or_insert(ty);
+        }
+        for (location, (_, slot)) in varying.values_mut().enumerate() {
+            *slot = location as u32;
+        }
+        let meta = ShaderMeta {
+            uniforms: UniformBlockLayout { uniforms: vec![] },
+            images: vec![],
+        };
+
+        let (vertex, attributes) = translate(&vertex, true, &meta, &varying);
+        let (fragment, _) = translate(&fragment, false, &meta, &varying);
+
+        assert_eq!(attributes.get("position"), Some(&0));
+        assert!(vertex.contains("layout(location=0) in vec2 position"));
+        assert!(vertex.contains("layout(location=0) out vec2 uv"));
+        assert!(fragment.contains("layout(location=0) in vec2 uv"));
+        assert!(fragment.contains("layout(location=0) out vec4 frag_color"));
+    }
+}
 pub(super) fn compile(
     device: &wgpu::Device,
     source: ShaderSource,
@@ -275,8 +329,8 @@ pub(super) fn compile(
     };
     let vt = tokens(vertex);
     let ft = tokens(fragment);
-    let mut varying = declarations(&vt, "varying");
-    for (name, ty) in declarations(&ft, "varying") {
+    let mut varying = declarations(&vt, &["varying", "out"]);
+    for (name, ty) in declarations(&ft, &["varying", "in"]) {
         varying.entry(name).or_insert(ty);
     }
     let mut location = 0;

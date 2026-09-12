@@ -788,8 +788,26 @@ impl RenderingBackend for WgpuContext {
         // finishes with them, which creates a large transient footprint and
         // makes the allocator retain the freed blocks. Keep the GPU buffer
         // alive and upload the new contents in place instead.
-        if !b.bytes.is_empty() {
-            let upload = buffer_upload_bytes(b.kind, b.element_size, &b.bytes);
+        // Upload only the slice supplied by the caller. `b.bytes` is the
+        // backing allocation/capacity, not the number of elements used by
+        // this draw. Uploading it here turns a 26 MiB instance buffer with a
+        // few visible notes into a 26 MiB staging allocation every frame.
+        // Those allocations remain in flight until Metal retires the command
+        // buffer and can easily dominate the post-gameplay footprint.
+        if !bytes.is_empty() {
+            let upload = buffer_upload_bytes(b.kind, b.element_size, &bytes);
+            // wgpu copy commands require the size to be a multiple of 4,
+            // while miniquad's slice may contain an odd number of u16
+            // indices. Pad only the staging copy; the destination buffer and
+            // the logical miniquad byte length remain unchanged.
+            let upload = if upload.len().is_multiple_of(4) {
+                upload
+            } else {
+                let aligned_len = (upload.len() + 3) & !3;
+                let mut padded = upload.into_owned();
+                padded.resize(aligned_len, 0);
+                Cow::Owned(padded)
+            };
             let mut encoder = self.encoder.borrow_mut();
             let encoder = encoder.get_or_insert_with(|| {
                 device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
