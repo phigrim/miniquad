@@ -93,11 +93,7 @@ fn dead_keysym_to_char(keysym: u32) -> Option<char> {
 }
 
 impl WaylandPayload {
-    unsafe fn process_key_event(
-        &mut self,
-        key: core::ffi::c_uint,
-        repeat: bool,
-    ) {
+    unsafe fn process_key_event(&mut self, key: core::ffi::c_uint, repeat: bool) {
         let libxkb = &mut self.xkb;
         let keymap = &self.keymap;
         let xkb_state = self.xkb_state;
@@ -105,7 +101,8 @@ impl WaylandPayload {
 
         let keysym_raw = libxkb.keymap_key_get_sym_without_mod(keymap.xkb_keymap, key + 8);
         let keycode = keycodes::translate_keysym(keysym_raw);
-        self.events.push(WaylandEvent::KeyDown(keycode, keymods, repeat));
+        self.events
+            .push(WaylandEvent::KeyDown(keycode, keymods, repeat));
 
         if self.external_ime_active {
             return;
@@ -126,13 +123,17 @@ impl WaylandPayload {
                         buf.len(),
                     );
                     let preedit_str = if len > 0 {
-                        std::str::from_utf8(&buf[..len as usize]).unwrap_or("").to_string()
+                        std::str::from_utf8(&buf[..len as usize])
+                            .unwrap_or("")
+                            .to_string()
                     } else if let Some(c) = dead_keysym_to_char(keysym) {
                         c.to_string()
                     } else {
                         let chr = (libxkb.xkb_keysym_to_utf32)(keysym);
                         if chr > 0 && chr < 0xFE00 {
-                            char::from_u32(chr).map(|c| c.to_string()).unwrap_or_default()
+                            char::from_u32(chr)
+                                .map(|c| c.to_string())
+                                .unwrap_or_default()
                         } else {
                             String::new()
                         }
@@ -755,7 +756,9 @@ unsafe extern "C" fn keyboard_handle_leave(
     display.keyboard_context.enter_serial = None;
     if display.compose_preediting {
         display.compose_preediting = false;
-        display.events.push(WaylandEvent::ImePreedit(String::new(), 0));
+        display
+            .events
+            .push(WaylandEvent::ImePreedit(String::new(), 0));
     }
     if !display.xkb_compose_state.is_null() {
         (display.xkb.xkb_compose_state_reset)(display.xkb_compose_state);
@@ -995,9 +998,13 @@ unsafe extern "C" fn touch_handle_motion(
         let x = wl_fixed_to_double(x) * d.dpi_scale;
         let y = wl_fixed_to_double(y) * d.dpi_scale;
         display.touch_positions.insert(id, (x, y));
-        display
-            .events
-            .push(WaylandEvent::Touch(crate::TouchPhase::Moved, id as _, x, y, time as f64 / 1000.));
+        display.events.push(WaylandEvent::Touch(
+            crate::TouchPhase::Moved,
+            id as _,
+            x,
+            y,
+            time as f64 / 1000.,
+        ));
     }
 }
 
@@ -1011,9 +1018,13 @@ unsafe extern "C" fn touch_handle_up(
     let display: &mut WaylandPayload = &mut *(data as *mut _);
     if display.focused_window == display.surface {
         if let Some((x, y)) = display.touch_positions.remove(&id) {
-            display
-                .events
-                .push(WaylandEvent::Touch(crate::TouchPhase::Ended, id as _, x, y, time as f64 / 1000.));
+            display.events.push(WaylandEvent::Touch(
+                crate::TouchPhase::Ended,
+                id as _,
+                x,
+                y,
+                time as f64 / 1000.,
+            ));
         }
     }
 }
@@ -1064,7 +1075,9 @@ unsafe extern "C" fn text_input_handle_preedit_string(
             .unwrap_or("")
             .to_string()
     };
-    display.events.push(WaylandEvent::ImePreedit(preedit, cursor_end as usize));
+    display
+        .events
+        .push(WaylandEvent::ImePreedit(preedit, cursor_end as usize));
 }
 
 unsafe extern "C" fn text_input_handle_commit_string(
@@ -1081,7 +1094,11 @@ unsafe extern "C" fn text_input_handle_commit_string(
             .to_str()
             .unwrap_or("")
             .to_string();
-        if s.is_empty() { None } else { Some(s) }
+        if s.is_empty() {
+            None
+        } else {
+            Some(s)
+        }
     };
     display.events.push(WaylandEvent::ImeCommit(commit));
 }
@@ -1321,7 +1338,8 @@ where
             .or_else(|_| std::env::var("LC_CTYPE"))
             .or_else(|_| std::env::var("LANG"))
             .unwrap_or_else(|_| "C".to_string());
-        let locale_c = std::ffi::CString::new(locale).unwrap_or_else(|_| std::ffi::CString::new("C").unwrap());
+        let locale_c =
+            std::ffi::CString::new(locale).unwrap_or_else(|_| std::ffi::CString::new("C").unwrap());
 
         let xkb_compose_table = if !xkb_context.is_null() {
             (xkb.xkb_compose_table_new_from_locale)(

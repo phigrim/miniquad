@@ -100,13 +100,7 @@ macro_rules! wayland_interface {
 pub mod wayland_protocol {
     use super::super::{wl_interface, wl_message};
 
-    wayland_interface!(
-        wl_surface_interface,
-        wl_surface,
-        1,
-        [],
-        []
-    );
+    wayland_interface!(wl_surface_interface, wl_surface, 1, [], []);
 
     wayland_interface!(
         wl_output_interface,

@@ -295,8 +295,16 @@ pub extern "C" fn on_ime_state_changed(
     element_id: u64,
 ) {
     let text = unsafe { String::from_raw_parts(text_ptr, text_len, text_len) };
-    let composing_start = if comp_start >= 0 { Some(comp_start as usize) } else { None };
-    let composing_end = if comp_end >= 0 { Some(comp_end as usize) } else { None };
+    let composing_start = if comp_start >= 0 {
+        Some(comp_start as usize)
+    } else {
+        None
+    };
+    let composing_end = if comp_end >= 0 {
+        Some(comp_end as usize)
+    } else {
+        None
+    };
     tl_event_handler(|event_handler| {
         event_handler.on_ime_state_changed(
             &text,

@@ -215,7 +215,8 @@ impl MainThreadState {
                 y,
                 time,
             } => {
-                self.event_handler.touch_event(phase, touch_id, x, y, time as f64 / 1000.);
+                self.event_handler
+                    .touch_event(phase, touch_id, x, y, time as f64 / 1000.);
             }
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
@@ -251,12 +252,28 @@ impl MainThreadState {
             Message::ImeCommit(text) => {
                 self.event_handler.on_ime_commit(text.as_deref());
             }
-            Message::ImeStateChanged { text, selection_start, selection_end, composing_start, composing_end, element_id } => {
-                self.event_handler.on_ime_state_changed(&text, selection_start, selection_end, composing_start, composing_end, element_id);
+            Message::ImeStateChanged {
+                text,
+                selection_start,
+                selection_end,
+                composing_start,
+                composing_end,
+                element_id,
+            } => {
+                self.event_handler.on_ime_state_changed(
+                    &text,
+                    selection_start,
+                    selection_end,
+                    composing_start,
+                    composing_end,
+                    element_id,
+                );
             }
             Message::ImeAction(_action_code) => {
-                self.event_handler.key_down_event(KeyCode::Enter, self.keymods, false);
-                self.event_handler.key_up_event(KeyCode::Enter, self.keymods);
+                self.event_handler
+                    .key_down_event(KeyCode::Enter, self.keymods, false);
+                self.event_handler
+                    .key_up_event(KeyCode::Enter, self.keymods);
             }
             Message::Pause => self.event_handler.window_minimized_event(),
             Message::Resume => {
@@ -790,14 +807,30 @@ pub unsafe extern "C" fn Java_quad_1native_QuadNative_surfaceOnImeStateChanged(
     element_id: ndk_sys::jlong,
 ) {
     let s = jstring_to_string(env, text).unwrap_or_default();
-    let sel_start = if selection_start >= 0 { selection_start as usize } else { 0 };
-    let sel_end = if selection_end >= 0 { selection_end as usize } else { 0 };
+    let sel_start = if selection_start >= 0 {
+        selection_start as usize
+    } else {
+        0
+    };
+    let sel_end = if selection_end >= 0 {
+        selection_end as usize
+    } else {
+        0
+    };
     send_message(Message::ImeStateChanged {
         text: s,
         selection_start: sel_start,
         selection_end: sel_end,
-        composing_start: if composing_start >= 0 { Some(composing_start as usize) } else { None },
-        composing_end: if composing_end >= 0 { Some(composing_end as usize) } else { None },
+        composing_start: if composing_start >= 0 {
+            Some(composing_start as usize)
+        } else {
+            None
+        },
+        composing_end: if composing_end >= 0 {
+            Some(composing_end as usize)
+        } else {
+            None
+        },
         element_id: element_id as u64,
     });
 }

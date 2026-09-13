@@ -2053,7 +2053,7 @@ impl RenderingBackend for GlContext {
         self.cache.clear_texture_bindings();
     }
 
-    fn draw(&self, base_element: i32, num_elements: i32, num_instances: i32) {
+    fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32) {
         assert!(
             self.cache.cur_pipeline.is_some(),
             "Drawing without any binded pipeline"

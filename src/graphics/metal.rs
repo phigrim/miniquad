@@ -1557,7 +1557,7 @@ impl RenderingBackend for MetalContext {
         self.index_buffer = None;
     }
 
-    fn draw(&self, base_element: i32, num_elements: i32, num_instances: i32) {
+    fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32) {
         assert!(self.render_encoder.is_some(), "draw before begin_pass!");
         let render_encoder = self.render_encoder.unwrap();
         assert!(self.index_buffer.is_some());

@@ -78,11 +78,36 @@ pub enum LinuxBackend {
 /// is enabled by default and Metal is enabled with the `metal` feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GfxApi {
+    /// Use the WebGPU-native backend on desktop platforms.
+    #[cfg(all(
+        feature = "wgpu",
+        any(target_os = "windows", target_os = "linux", target_os = "macos")
+    ))]
+    Wgpu,
     /// Use OpenGL.
     #[cfg(any(not(target_vendor = "apple"), feature = "opengl"))]
     OpenGl,
     /// Use Metal on Apple platforms.
     #[cfg(all(target_vendor = "apple", feature = "metal"))]
+    Metal,
+}
+
+/// Selects the native API used by the WGPU backend.
+///
+/// `Auto` uses the best portable native backend for the platform. On Windows
+/// it prefers Vulkan and falls back to DX12; this is deliberate because WGPU's
+/// adapter selection order is otherwise driver-dependent.
+#[cfg(feature = "wgpu")]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
+pub enum WgpuBackend {
+    /// Prefer the high-performance native API for the current platform.
+    #[default]
+    Auto,
+    /// Vulkan. Available on Windows and Linux.
+    Vulkan,
+    /// Direct3D 12. Available on Windows.
+    Dx12,
+    /// Metal. Available on macOS.
     Metal,
 }
 
@@ -97,7 +122,11 @@ impl Default for GfxApi {
         Self::Metal
     }
 
-    #[cfg(all(target_vendor = "apple", not(feature = "opengl"), not(feature = "metal")))]
+    #[cfg(all(
+        target_vendor = "apple",
+        not(feature = "opengl"),
+        not(feature = "metal")
+    ))]
     fn default() -> Self {
         unreachable!("an Apple graphics backend feature must be enabled")
     }
@@ -147,6 +176,10 @@ pub struct Platform {
 
     /// Defines which available rendering API should be preferred on Apple platforms.
     pub prefer_gfx_api: GfxApi,
+
+    /// The native graphics API to use when [`GfxApi::Wgpu`] is selected.
+    #[cfg(feature = "wgpu")]
+    pub wgpu_backend: WgpuBackend,
 
     /// Optional swap interval (vertical sync).
     ///
@@ -205,6 +238,8 @@ impl Default for Platform {
             linux_x11_gl: LinuxX11Gl::default(),
             linux_backend: LinuxBackend::default(),
             prefer_gfx_api: GfxApi::default(),
+            #[cfg(feature = "wgpu")]
+            wgpu_backend: WgpuBackend::default(),
             webgl_version: WebGLVersion::default(),
             blocking_event_loop: false,
             sleep_interval_ms: None,

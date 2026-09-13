@@ -8,12 +8,24 @@ use std::{error::Error, fmt::Display};
 
 mod gl;
 
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+mod wgpu;
+
 pub use gl::raw_gl;
 
 #[cfg(all(target_vendor = "apple", feature = "metal"))]
 mod metal;
 
 pub use gl::GlContext;
+
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+pub use self::wgpu::WgpuContext;
 
 #[cfg(all(target_vendor = "apple", feature = "metal"))]
 pub use metal::MetalContext;
@@ -1455,8 +1467,17 @@ impl<'a> UniformsSource<'a> {
 
 #[derive(Debug)]
 pub enum ShaderSource<'a> {
-    Glsl { vertex: &'a str, fragment: &'a str },
-    Msl { program: &'a str },
+    Glsl {
+        vertex: &'a str,
+        fragment: &'a str,
+    },
+    Msl {
+        program: &'a str,
+    },
+    #[cfg(feature = "wgpu")]
+    Wgsl {
+        program: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Hash, Eq)]
@@ -1482,6 +1503,8 @@ pub struct GlslSupport {
 pub enum Backend {
     Metal,
     OpenGl,
+    #[cfg(feature = "wgpu")]
+    Wgpu,
 }
 
 #[derive(Clone, Debug)]
@@ -1505,6 +1528,8 @@ impl ContextInfo {
     pub fn has_integer_attributes(&self) -> bool {
         match self.backend {
             Backend::Metal => true,
+            #[cfg(feature = "wgpu")]
+            Backend::Wgpu => true,
             Backend::OpenGl => {
                 self.glsl_support.v150 | self.glsl_support.v300es | self.glsl_support.v330
             }
@@ -1810,5 +1835,19 @@ pub trait RenderingBackend {
     ///
     /// NOTE: num_instances > 1 might be not supported by the GPU (gl2.1 and gles2).
     /// `features.instancing` check is required.
-    fn draw(&self, base_element: i32, num_elements: i32, num_instances: i32);
+    fn draw(&mut self, base_element: i32, num_elements: i32, num_instances: i32);
+
+    /// Draw with an additional signed vertex-buffer base. Backends that do not
+    /// expose indexed base-vertex drawing retain the traditional zero-only
+    /// behavior; wgpu uses this to render many macroquad batches from one upload.
+    fn draw_with_base_vertex(
+        &mut self,
+        base_element: i32,
+        num_elements: i32,
+        num_instances: i32,
+        base_vertex: i32,
+    ) {
+        assert_eq!(base_vertex, 0, "base vertex is unsupported by this backend");
+        self.draw(base_element, num_elements, num_instances);
+    }
 }

@@ -297,7 +297,9 @@ extern "C" {
     pub fn CVDisplayLinkStart(display_link: CVDisplayLinkRef) -> i32;
     pub fn CVDisplayLinkStop(display_link: CVDisplayLinkRef) -> i32;
     pub fn CVDisplayLinkRelease(display_link: CVDisplayLinkRef);
-    pub fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(display_link: CVDisplayLinkRef) -> CVTime;
+    pub fn CVDisplayLinkGetNominalOutputVideoRefreshPeriod(
+        display_link: CVDisplayLinkRef,
+    ) -> CVTime;
 }
 
 // Foundation

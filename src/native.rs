@@ -24,13 +24,17 @@ pub(crate) struct NativeDisplayData {
     pub clipboard: Box<dyn Clipboard>,
     pub dropped_files: DroppedFiles,
     pub blocking_event_loop: bool,
+    pub sample_count: u32,
+    pub swap_interval: Option<i32>,
+
+    pub gfx_api: crate::conf::GfxApi,
+    #[cfg(feature = "wgpu")]
+    pub wgpu_backend: crate::conf::WgpuBackend,
 
     #[cfg(target_vendor = "apple")]
     pub view: crate::native::apple::frameworks::ObjcId,
     #[cfg(target_os = "ios")]
     pub view_ctrl: crate::native::apple::frameworks::ObjcId,
-    #[cfg(target_vendor = "apple")]
-    pub gfx_api: crate::conf::GfxApi,
 }
 #[cfg(target_vendor = "apple")]
 unsafe impl Send for NativeDisplayData {}
@@ -58,8 +62,11 @@ impl NativeDisplayData {
             clipboard,
             dropped_files: Default::default(),
             blocking_event_loop: false,
-            #[cfg(target_vendor = "apple")]
+            sample_count: 1,
+            swap_interval: None,
             gfx_api: crate::conf::GfxApi::default(),
+            #[cfg(feature = "wgpu")]
+            wgpu_backend: crate::conf::WgpuBackend::default(),
             #[cfg(target_vendor = "apple")]
             view: std::ptr::null_mut(),
             #[cfg(target_os = "ios")]
@@ -74,11 +81,20 @@ pub(crate) enum Request {
     SetCursorGrab(bool),
     ShowMouse(bool),
     SetMouseCursor(crate::CursorIcon),
-    SetWindowSize { new_width: u32, new_height: u32 },
-    SetWindowPosition { new_x: u32, new_y: u32 },
+    SetWindowSize {
+        new_width: u32,
+        new_height: u32,
+    },
+    SetWindowPosition {
+        new_x: u32,
+        new_y: u32,
+    },
     SetFullscreen(bool),
     ShowKeyboard(bool),
-    SetImePosition { x: i32, y: i32 },
+    SetImePosition {
+        x: i32,
+        y: i32,
+    },
     SetImeEnabled(bool),
     UpdateTextInputState {
         text: String,
@@ -97,6 +113,12 @@ pub trait Clipboard: Send + Sync {
 }
 
 pub mod module;
+
+#[cfg(all(
+    feature = "wgpu",
+    any(target_os = "windows", target_os = "linux", target_os = "macos")
+))]
+pub mod winit;
 
 #[cfg(target_env = "ohos")]
 pub mod ohos;
