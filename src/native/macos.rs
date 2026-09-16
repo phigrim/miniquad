@@ -1636,6 +1636,8 @@ unsafe fn perform_redraw(display: &mut MacosDisplay, gfx_api: GfxApi, _in_draw_r
             }
         }
         match gfx_api {
+            #[cfg(feature = "wgpu")]
+            GfxApi::Wgpu => unreachable!("WGPU uses the winit macOS event loop"),
             #[cfg(feature = "opengl")]
             GfxApi::OpenGl => {
                 msg_send_!(display.gl_context, flushBuffer);
@@ -1740,6 +1742,8 @@ where
     let () = msg_send![window, setTitle: title];
 
     let view = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "wgpu")]
+        GfxApi::Wgpu => unreachable!("WGPU uses the winit macOS event loop"),
         #[cfg(feature = "opengl")]
         GfxApi::OpenGl => create_opengl_view(&mut display, conf.sample_count, conf.high_dpi),
         #[cfg(feature = "metal")]
@@ -1794,6 +1798,8 @@ where
     // Found this here: https://github.com/kovidgoyal/kitty/issues/6341#issuecomment-1578348104
     let current_runloop = msg_send_![class!(NSRunLoop), currentRunLoop];
     let timer = match conf.platform.prefer_gfx_api {
+        #[cfg(feature = "wgpu")]
+        GfxApi::Wgpu => unreachable!("WGPU uses the winit macOS event loop"),
         #[cfg(feature = "opengl")]
         GfxApi::OpenGl => msg_send_![class!(NSTimer), timerWithTimeInterval:0.016 // ~60FPS
                                                            target:view
