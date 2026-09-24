@@ -35,7 +35,6 @@ log-impl = []
 wgpu = { version = "0.19", optional = true, default-features = false, features = ["dx12", "metal", "vulkan-portability", "wgsl"] }
 pollster = { version = "0.3", optional = true }
 smallvec = { version = "1", optional = true }
-arboard = { version = "3", optional = true, default-features = false }
 
 [target.'cfg(any(target_os = "windows", target_os = "macos"))'.dependencies]
 winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06"] }
@@ -43,6 +42,9 @@ winit = { version = "0.30", optional = true, default-features = false, features 
 [target.'cfg(target_os = "linux")'.dependencies]
 libc = "0.2"
 winit = { version = "0.30", optional = true, default-features = false, features = ["rwh_06", "x11", "wayland", "wayland-dlopen"] }
+
+[target.'cfg(any(target_os = "windows", target_os = "macos", target_os = "linux"))'.dependencies]
+arboard = { version = "3", optional = true, default-features = false }
 
 [target.'cfg(windows)'.dependencies]
 winapi = { version = "0.3", features = [
