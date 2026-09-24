@@ -118,6 +118,7 @@ fn set_display(display: native::NativeDisplayData) {
 }
 /// This for now is Android specific since the process can continue running but the display
 /// is restarted. We support reinitializing the display.
+#[cfg(any(target_os = "android", target_env = "ohos"))]
 fn set_or_replace_display(display: native::NativeDisplayData) {
     if let Some(m) = NATIVE_DISPLAY.get() {
         // Replace existing display
@@ -143,7 +144,12 @@ pub mod window {
         match window::gfx_api() {
             #[cfg(all(
                 feature = "wgpu",
-                any(target_os = "windows", target_os = "linux", target_os = "macos")
+                any(
+                    target_os = "windows",
+                    target_os = "linux",
+                    target_os = "macos",
+                    target_os = "android"
+                )
             ))]
             conf::GfxApi::Wgpu => Box::new(WgpuContext::new()),
             #[cfg(feature = "metal")]
@@ -447,7 +453,6 @@ pub mod window {
     /// This should be called when the text cursor moves to keep the IME
     /// candidate window near the insertion point.
     pub fn set_ime_position(x: i32, y: i32) {
-        let d = native_display().lock().unwrap();
         #[cfg(target_os = "android")]
         {
             let _ = (x, y); // IME position not applicable on Android
@@ -455,6 +460,7 @@ pub mod window {
 
         #[cfg(not(target_os = "android"))]
         {
+            let d = native_display().lock().unwrap();
             d.native_requests
                 .send(native::Request::SetImePosition { x, y })
                 .unwrap();

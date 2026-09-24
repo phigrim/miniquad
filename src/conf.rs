@@ -78,10 +78,15 @@ pub enum LinuxBackend {
 /// is enabled by default and Metal is enabled with the `metal` feature.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum GfxApi {
-    /// Use the WebGPU-native backend on desktop platforms.
+    /// Use the WebGPU-native backend.
     #[cfg(all(
         feature = "wgpu",
-        any(target_os = "windows", target_os = "linux", target_os = "macos")
+        any(
+            target_os = "windows",
+            target_os = "linux",
+            target_os = "macos",
+            target_os = "android"
+        )
     ))]
     Wgpu,
     /// Use OpenGL.
@@ -94,17 +99,19 @@ pub enum GfxApi {
 
 /// Selects the native API used by the WGPU backend.
 ///
-/// `Auto` uses the best portable native backend for the platform. On Windows
-/// it prefers Vulkan and falls back to DX12; this is deliberate because WGPU's
-/// adapter selection order is otherwise driver-dependent.
+/// `Auto` tries the platform's preferred native backends in a deterministic
+/// order. On Android it tries Vulkan first and GLES second. On Windows it tries
+/// Vulkan first and DX12 second.
 #[cfg(feature = "wgpu")]
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum WgpuBackend {
     /// Prefer the high-performance native API for the current platform.
     #[default]
     Auto,
-    /// Vulkan. Available on Windows and Linux.
+    /// Vulkan. Available on Windows, Linux, and Android.
     Vulkan,
+    /// OpenGL ES. Available on Android.
+    Gles,
     /// Direct3D 12. Available on Windows.
     Dx12,
     /// Metal. Available on macOS.

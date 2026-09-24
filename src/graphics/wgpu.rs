@@ -8,11 +8,7 @@
 use super::*;
 use ::wgpu::util::DeviceExt;
 use smallvec::SmallVec;
-use std::{
-    collections::HashMap,
-    num::{NonZeroU32, NonZeroU64},
-    sync::Arc,
-};
+use std::{collections::HashMap, num::NonZeroU64, sync::Arc};
 
 const UNIFORM_ALIGNMENT: usize = 256;
 const INITIAL_UNIFORM_CAPACITY: usize = 256 * 1024;
@@ -96,9 +92,156 @@ struct BindGroupKey {
     sampler_generation: u64,
 }
 
+#[derive(Clone)]
+enum SurfaceTargetOwner {
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    Desktop(Arc<winit::window::Window>),
+    #[cfg(target_os = "android")]
+    Android(Arc<crate::native::android::AndroidNativeWindow>),
+}
+
+impl SurfaceTargetOwner {
+    fn create_surface(
+        &self,
+        instance: &::wgpu::Instance,
+    ) -> Result<::wgpu::Surface<'static>, ::wgpu::CreateSurfaceError> {
+        match self {
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            Self::Desktop(window) => instance.create_surface(window.clone()),
+            #[cfg(target_os = "android")]
+            Self::Android(window) => instance.create_surface(
+                ::wgpu::SurfaceTarget::from_window_without_display(window.clone()),
+            ),
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+#[derive(Debug)]
+struct AndroidDisplayHandleOwner;
+
+#[cfg(target_os = "android")]
+impl ::wgpu::rwh::HasDisplayHandle for AndroidDisplayHandleOwner {
+    fn display_handle(&self) -> Result<::wgpu::rwh::DisplayHandle<'_>, ::wgpu::rwh::HandleError> {
+        Ok(::wgpu::rwh::DisplayHandle::android())
+    }
+}
+
+#[derive(Clone)]
+struct SurfaceSnapshot {
+    generation: u64,
+    target: Option<SurfaceTargetOwner>,
+    width: u32,
+    height: u32,
+    ready: bool,
+}
+
+enum SurfaceSource {
+    #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+    Desktop(Arc<winit::window::Window>),
+    #[cfg(target_os = "android")]
+    Android(Arc<crate::native::android::AndroidSurfaceSource>),
+}
+
+impl SurfaceSource {
+    fn snapshot(&self) -> SurfaceSnapshot {
+        match self {
+            #[cfg(any(target_os = "windows", target_os = "linux", target_os = "macos"))]
+            Self::Desktop(window) => {
+                let size = window.inner_size();
+                SurfaceSnapshot {
+                    generation: 1,
+                    target: Some(SurfaceTargetOwner::Desktop(window.clone())),
+                    width: size.width.max(1),
+                    height: size.height.max(1),
+                    ready: true,
+                }
+            }
+            #[cfg(target_os = "android")]
+            Self::Android(source) => {
+                let snapshot = source.snapshot();
+                SurfaceSnapshot {
+                    generation: snapshot.generation,
+                    target: snapshot.target.map(SurfaceTargetOwner::Android),
+                    width: snapshot.width,
+                    height: snapshot.height,
+                    ready: snapshot.ready,
+                }
+            }
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+impl ::wgpu::rwh::HasWindowHandle for crate::native::android::AndroidNativeWindow {
+    fn window_handle(&self) -> Result<::wgpu::rwh::WindowHandle<'_>, ::wgpu::rwh::HandleError> {
+        let native_window = std::ptr::NonNull::new(self.as_ptr().cast())
+            .expect("AndroidNativeWindow always owns a non-null native window");
+        let raw = ::wgpu::rwh::AndroidNdkWindowHandle::new(native_window).into();
+        // SAFETY: `self` owns an ANativeWindow reference and the returned
+        // borrowed handle cannot outlive this owner.
+        Ok(unsafe { ::wgpu::rwh::WindowHandle::borrow_raw(raw) })
+    }
+}
+
+#[allow(dead_code)] // Every target constructs only its own platform variant.
+#[derive(Clone, Copy)]
+enum BackendPlatform {
+    Windows,
+    Linux,
+    Macos,
+    Android,
+}
+
+#[cfg(target_os = "windows")]
+fn backend_platform() -> BackendPlatform {
+    BackendPlatform::Windows
+}
+#[cfg(target_os = "linux")]
+fn backend_platform() -> BackendPlatform {
+    BackendPlatform::Linux
+}
+#[cfg(target_os = "macos")]
+fn backend_platform() -> BackendPlatform {
+    BackendPlatform::Macos
+}
+#[cfg(target_os = "android")]
+fn backend_platform() -> BackendPlatform {
+    BackendPlatform::Android
+}
+
+fn backend_candidates(
+    requested: crate::conf::WgpuBackend,
+    platform: BackendPlatform,
+) -> Vec<(::wgpu::Backends, &'static str)> {
+    use crate::conf::WgpuBackend;
+
+    match requested {
+        WgpuBackend::Auto => match platform {
+            BackendPlatform::Windows => vec![
+                (::wgpu::Backends::VULKAN, "Vulkan"),
+                (::wgpu::Backends::DX12, "Direct3D 12"),
+            ],
+            BackendPlatform::Linux => vec![(::wgpu::Backends::VULKAN, "Vulkan")],
+            BackendPlatform::Macos => vec![(::wgpu::Backends::METAL, "Metal")],
+            BackendPlatform::Android => vec![
+                (::wgpu::Backends::VULKAN, "Vulkan"),
+                (::wgpu::Backends::GL, "GLES"),
+            ],
+        },
+        WgpuBackend::Vulkan => vec![(::wgpu::Backends::VULKAN, "Vulkan")],
+        WgpuBackend::Gles => vec![(::wgpu::Backends::GL, "GLES")],
+        WgpuBackend::Dx12 => vec![(::wgpu::Backends::DX12, "Direct3D 12")],
+        WgpuBackend::Metal => vec![(::wgpu::Backends::METAL, "Metal")],
+    }
+}
+
 pub struct WgpuContext {
     _instance: ::wgpu::Instance,
-    surface: ::wgpu::Surface<'static>,
+    adapter: ::wgpu::Adapter,
+    surface_source: SurfaceSource,
+    surface_generation: u64,
+    surface: Option<::wgpu::Surface<'static>>,
     device: ::wgpu::Device,
     queue: ::wgpu::Queue,
     surface_config: ::wgpu::SurfaceConfiguration,
@@ -107,6 +250,7 @@ pub struct WgpuContext {
     default_msaa: Option<Texture>,
     default_depth: Option<Texture>,
     sample_count: u32,
+    swap_interval: Option<i32>,
 
     shaders: Vec<Option<Shader>>,
     pipelines: Vec<Option<PipelineResource>>,
@@ -145,99 +289,186 @@ pub struct WgpuContext {
     buffer_upload_scratch: Vec<u8>,
 }
 
-fn wgpu_adapter_for_window(
-    window: Arc<winit::window::Window>,
-    requested: crate::conf::WgpuBackend,
-) -> Option<(::wgpu::Instance, ::wgpu::Surface<'static>, ::wgpu::Adapter)> {
-    let candidates: &[::wgpu::Backends] = match requested {
-        crate::conf::WgpuBackend::Auto => {
-            #[cfg(target_os = "windows")]
-            {
-                &[::wgpu::Backends::VULKAN, ::wgpu::Backends::DX12]
-            }
-            #[cfg(target_os = "linux")]
-            {
-                &[::wgpu::Backends::VULKAN]
-            }
-            #[cfg(target_os = "macos")]
-            {
-                &[::wgpu::Backends::METAL]
-            }
-        }
-        crate::conf::WgpuBackend::Vulkan => &[::wgpu::Backends::VULKAN],
-        crate::conf::WgpuBackend::Dx12 => &[::wgpu::Backends::DX12],
-        crate::conf::WgpuBackend::Metal => &[::wgpu::Backends::METAL],
-    };
+struct WgpuInitialization {
+    instance: ::wgpu::Instance,
+    surface: ::wgpu::Surface<'static>,
+    adapter: ::wgpu::Adapter,
+    device: ::wgpu::Device,
+    queue: ::wgpu::Queue,
+    surface_config: ::wgpu::SurfaceConfiguration,
+}
 
-    candidates.iter().find_map(|&backends| {
-        let instance = ::wgpu::Instance::new(::wgpu::InstanceDescriptor {
-            backends,
-            dx12_shader_compiler: Default::default(),
-            flags: ::wgpu::InstanceFlags::from_build_config(),
-            gles_minor_version: ::wgpu::Gles3MinorVersion::Automatic,
-        });
-        let surface = instance.create_surface(window.clone()).ok()?;
-        let adapter =
-            pollster::block_on(instance.request_adapter(&::wgpu::RequestAdapterOptions {
+fn wgpu_adapter_for_target(
+    target: &SurfaceTargetOwner,
+    requested: crate::conf::WgpuBackend,
+    size: (u32, u32),
+    swap_interval: Option<i32>,
+) -> Result<WgpuInitialization, String> {
+    let candidates = backend_candidates(requested, backend_platform());
+    let mut failures = Vec::with_capacity(candidates.len());
+    for (backends, name) in candidates {
+        #[cfg(target_os = "android")]
+        let mut descriptor = ::wgpu::InstanceDescriptor::new_with_display_handle(Box::new(
+            AndroidDisplayHandleOwner,
+        ));
+        #[cfg(not(target_os = "android"))]
+        let mut descriptor = ::wgpu::InstanceDescriptor::new_without_display_handle();
+        descriptor.backends = backends;
+        let instance = ::wgpu::Instance::new(descriptor);
+        let surface = match target.create_surface(&instance) {
+            Ok(surface) => surface,
+            Err(error) => {
+                failures.push(format!("{name}: surface creation failed: {error}"));
+                continue;
+            }
+        };
+        let adapter = match pollster::block_on(instance.request_adapter(
+            &::wgpu::RequestAdapterOptions {
                 power_preference: ::wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
-            }))?;
-        Some((instance, surface, adapter))
+            },
+        )) {
+            Ok(adapter) => adapter,
+            Err(error) => {
+                failures.push(format!("{name}: no compatible adapter: {error}"));
+                continue;
+            }
+        };
+        let surface_config = match surface_configuration(&surface, &adapter, size, swap_interval) {
+            Ok(config) => config,
+            Err(error) => {
+                failures.push(format!("{name}: surface is unusable: {error}"));
+                continue;
+            }
+        };
+        let limits = ::wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
+        let (device, queue) = match pollster::block_on(adapter.request_device(
+            &::wgpu::DeviceDescriptor {
+                label: Some("miniquad wgpu device"),
+                required_features: ::wgpu::Features::empty(),
+                required_limits: limits,
+                ..Default::default()
+            },
+        )) {
+            Ok(device_and_queue) => device_and_queue,
+            Err(error) => {
+                failures.push(format!("{name}: device creation failed: {error}"));
+                continue;
+            }
+        };
+        let error_scope = device.push_error_scope(::wgpu::ErrorFilter::Validation);
+        surface.configure(&device, &surface_config);
+        let _ = device.poll(::wgpu::PollType::wait_indefinitely());
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
+            failures.push(format!("{name}: surface configuration failed: {error}"));
+            continue;
+        }
+        return Ok(WgpuInitialization {
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+            surface_config,
+        });
+    }
+    Err(format!(
+        "failed to initialize WGPU ({:?}); attempted backends: {}",
+        requested,
+        failures.join("; ")
+    ))
+}
+
+fn surface_configuration(
+    surface: &::wgpu::Surface<'_>,
+    adapter: &::wgpu::Adapter,
+    size: (u32, u32),
+    swap_interval: Option<i32>,
+) -> Result<::wgpu::SurfaceConfiguration, String> {
+    let caps = surface.get_capabilities(adapter);
+    if !caps
+        .usages
+        .contains(::wgpu::TextureUsages::RENDER_ATTACHMENT)
+    {
+        return Err("surface does not support render-attachment usage".to_owned());
+    }
+    let format = caps
+        .formats
+        .iter()
+        .copied()
+        .find(|format| !format.is_srgb())
+        .or_else(|| caps.formats.first().copied())
+        .ok_or_else(|| "surface reports no supported texture formats".to_owned())?;
+    let present_mode = if swap_interval == Some(0) {
+        if caps.present_modes.contains(&::wgpu::PresentMode::Immediate) {
+            ::wgpu::PresentMode::Immediate
+        } else if caps.present_modes.contains(&::wgpu::PresentMode::Mailbox) {
+            ::wgpu::PresentMode::Mailbox
+        } else {
+            *caps
+                .present_modes
+                .first()
+                .ok_or_else(|| "surface reports no supported present modes".to_owned())?
+        }
+    } else if caps.present_modes.contains(&::wgpu::PresentMode::Fifo) {
+        ::wgpu::PresentMode::Fifo
+    } else {
+        *caps
+            .present_modes
+            .first()
+            .ok_or_else(|| "surface reports no supported present modes".to_owned())?
+    };
+    let alpha_mode = *caps
+        .alpha_modes
+        .first()
+        .ok_or_else(|| "surface reports no supported alpha modes".to_owned())?;
+
+    Ok(::wgpu::SurfaceConfiguration {
+        usage: ::wgpu::TextureUsages::RENDER_ATTACHMENT,
+        format,
+        width: size.0.max(1),
+        height: size.1.max(1),
+        present_mode,
+        alpha_mode,
+        view_formats: vec![],
+        desired_maximum_frame_latency: if swap_interval == Some(0) { 3 } else { 2 },
     })
 }
 
 impl WgpuContext {
     pub fn new() -> Self {
-        let requested_backend = crate::native_display().lock().unwrap().wgpu_backend;
-        let window = crate::native::winit::window();
-        let (instance, surface, adapter) = wgpu_adapter_for_window(window, requested_backend)
-            .expect("no high-performance wgpu adapter supports this window");
-        let limits = ::wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
-        let (device, queue) = pollster::block_on(adapter.request_device(
-            &::wgpu::DeviceDescriptor {
-                label: Some("miniquad wgpu device"),
-                required_features: ::wgpu::Features::empty(),
-                required_limits: limits,
-            },
-            None,
-        ))
-        .expect("failed to create wgpu device");
-        let caps = surface.get_capabilities(&adapter);
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or(caps.formats[0]);
-        let swap_interval = crate::native_display().lock().unwrap().swap_interval;
-        let present_mode = if swap_interval == Some(0) {
-            if caps.present_modes.contains(&::wgpu::PresentMode::Immediate) {
-                ::wgpu::PresentMode::Immediate
-            } else if caps.present_modes.contains(&::wgpu::PresentMode::Mailbox) {
-                ::wgpu::PresentMode::Mailbox
-            } else {
-                ::wgpu::PresentMode::Fifo
-            }
-        } else {
-            ::wgpu::PresentMode::Fifo
+        let (surface_source, requested_backend, swap_interval) = {
+            let display = crate::native_display().lock().unwrap();
+            #[cfg(target_os = "android")]
+            let source = SurfaceSource::Android(display.android_surface_source.clone());
+            #[cfg(not(target_os = "android"))]
+            let source = SurfaceSource::Desktop(crate::native::winit::window());
+            (source, display.wgpu_backend, display.swap_interval)
         };
-        let (width, height) = crate::window::screen_size();
-        let surface_config = ::wgpu::SurfaceConfiguration {
-            usage: ::wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width: width.max(1.0) as u32,
-            height: height.max(1.0) as u32,
-            present_mode,
-            alpha_mode: caps.alpha_modes[0],
-            view_formats: vec![],
-            // With immediate presentation, keeping one extra frame available
-            // avoids CPU-side surface-acquire backpressure while the GPU is
-            // finishing the previous command buffer. VSync keeps the more
-            // latency-sensitive two-frame default.
-            desired_maximum_frame_latency: if swap_interval == Some(0) { 3 } else { 2 },
-        };
-        surface.configure(&device, &surface_config);
+        let initial_snapshot = surface_source.snapshot();
+        assert!(
+            initial_snapshot.ready,
+            "WGPU backend initialized before an Android Surface became ready"
+        );
+        let target = initial_snapshot
+            .target
+            .as_ref()
+            .expect("a ready surface snapshot must have a window owner");
+        let WgpuInitialization {
+            instance,
+            surface,
+            adapter,
+            device,
+            queue,
+            surface_config,
+        } = wgpu_adapter_for_target(
+            target,
+            requested_backend,
+            (initial_snapshot.width, initial_snapshot.height),
+            swap_interval,
+        )
+        .unwrap_or_else(|error| panic!("{}", error));
         let uniform_buffer = device.create_buffer(&::wgpu::BufferDescriptor {
             label: Some("miniquad uniform ring"),
             size: INITIAL_UNIFORM_CAPACITY as u64,
@@ -245,9 +476,13 @@ impl WgpuContext {
             mapped_at_creation: false,
         });
         let sample_count = crate::native_display().lock().unwrap().sample_count;
+        let staging_belt = ::wgpu::util::StagingBelt::new(device.clone(), 1024 * 1024);
         let mut result = Self {
             _instance: instance,
-            surface,
+            adapter,
+            surface_source,
+            surface_generation: initial_snapshot.generation,
+            surface: Some(surface),
             device,
             queue,
             surface_config,
@@ -256,6 +491,7 @@ impl WgpuContext {
             default_msaa: None,
             default_depth: None,
             sample_count,
+            swap_interval,
             shaders: vec![],
             pipelines: vec![],
             buffers: vec![],
@@ -271,7 +507,7 @@ impl WgpuContext {
             viewport: None,
             scissor: None,
             frame_encoder: None,
-            staging_belt: ::wgpu::util::StagingBelt::new(1024 * 1024),
+            staging_belt,
             poll_frame: 0,
             default_depth_used_this_frame: false,
             uniform_cpu: Vec::with_capacity(INITIAL_UNIFORM_CAPACITY),
@@ -405,34 +641,103 @@ impl WgpuContext {
             Some(self.create_texture_resource(depth_params, "miniquad default depth"));
     }
 
-    fn resize_surface_if_needed(&mut self) {
-        let (width, height) = crate::window::screen_size();
-        let (width, height) = (width.max(1.0) as u32, height.max(1.0) as u32);
-        if (width, height) != (self.surface_config.width, self.surface_config.height) {
-            self.surface_config.width = width;
-            self.surface_config.height = height;
-            self.surface.configure(&self.device, &self.surface_config);
-            self.rebuild_default_attachments();
-        }
+    fn drop_surface(&mut self, generation: u64) {
+        // SurfaceTexture must go before Surface; Surface owns the native window
+        // handle source and releases its ANativeWindow reference on drop.
+        self.surface_view = None;
+        self.surface_frame = None;
+        self.surface = None;
+        self.surface_generation = generation;
     }
 
-    fn ensure_surface_frame(&mut self) {
-        self.resize_surface_if_needed();
-        if self.surface_frame.is_some() {
-            return;
-        }
-        let frame = match self.surface.get_current_texture() {
-            Ok(frame) => frame,
-            Err(::wgpu::SurfaceError::Lost | ::wgpu::SurfaceError::Outdated) => {
-                self.surface.configure(&self.device, &self.surface_config);
-                self.surface
-                    .get_current_texture()
-                    .expect("failed to reacquire wgpu surface")
+    fn sync_surface_source(&mut self) -> bool {
+        let snapshot = self.surface_source.snapshot();
+        if !snapshot.ready || snapshot.target.is_none() {
+            if self.surface.is_some() || self.surface_generation != snapshot.generation {
+                self.drop_surface(snapshot.generation);
             }
-            Err(error) => panic!("failed to acquire wgpu surface: {}", error),
+            return false;
+        }
+
+        if self.surface.is_none() || self.surface_generation != snapshot.generation {
+            self.drop_surface(snapshot.generation);
+            let target = snapshot.target.as_ref().unwrap();
+            let surface = target
+                .create_surface(&self._instance)
+                .unwrap_or_else(|error| {
+                    panic!("failed to create replacement WGPU surface: {}", error)
+                });
+            let config = surface_configuration(
+                &surface,
+                &self.adapter,
+                (snapshot.width, snapshot.height),
+                self.swap_interval,
+            )
+            .unwrap_or_else(|error| panic!("replacement WGPU surface is incompatible: {}", error));
+            surface.configure(&self.device, &config);
+            self.surface = Some(surface);
+            self.surface_config = config;
+            self.surface_generation = snapshot.generation;
+            self.rebuild_default_attachments();
+        } else if (snapshot.width, snapshot.height)
+            != (self.surface_config.width, self.surface_config.height)
+        {
+            self.surface_frame = None;
+            self.surface_view = None;
+            let surface = self.surface.as_ref().unwrap();
+            let config = surface_configuration(
+                surface,
+                &self.adapter,
+                (snapshot.width, snapshot.height),
+                self.swap_interval,
+            )
+            .unwrap_or_else(|error| panic!("resized WGPU surface is incompatible: {}", error));
+            surface.configure(&self.device, &config);
+            self.surface_config = config;
+            self.rebuild_default_attachments();
+        }
+        true
+    }
+
+    fn ensure_surface_frame(&mut self) -> bool {
+        if !self.sync_surface_source() {
+            return false;
+        }
+        if self.surface_frame.is_some() {
+            return true;
+        }
+        let status = self.surface.as_ref().unwrap().get_current_texture();
+        let frame = match status {
+            ::wgpu::CurrentSurfaceTexture::Success(frame)
+            | ::wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+            ::wgpu::CurrentSurfaceTexture::Lost => {
+                // A lost native surface must be recreated, not merely
+                // reconfigured. The retained source still owns the current
+                // window, so the next frame will attach it again.
+                self.drop_surface(self.surface_generation);
+                return false;
+            }
+            ::wgpu::CurrentSurfaceTexture::Outdated => {
+                self.surface
+                    .as_ref()
+                    .unwrap()
+                    .configure(&self.device, &self.surface_config);
+                match self.surface.as_ref().unwrap().get_current_texture() {
+                    ::wgpu::CurrentSurfaceTexture::Success(frame)
+                    | ::wgpu::CurrentSurfaceTexture::Suboptimal(frame) => frame,
+                    ::wgpu::CurrentSurfaceTexture::Timeout
+                    | ::wgpu::CurrentSurfaceTexture::Occluded => return false,
+                    status => panic!("failed to reacquire WGPU surface: {:?}", status),
+                }
+            }
+            ::wgpu::CurrentSurfaceTexture::Timeout | ::wgpu::CurrentSurfaceTexture::Occluded => {
+                return false
+            }
+            status => panic!("failed to acquire WGPU surface: {:?}", status),
         };
         self.surface_view = Some(frame.texture.create_view(&Default::default()));
         self.surface_frame = Some(frame);
+        true
     }
 
     fn ensure_uniform_capacity(&mut self) {
@@ -481,9 +786,9 @@ impl WgpuContext {
                 ::wgpu::FilterMode::Nearest
             },
             mipmap_filter: if texture.params.mipmap_filter == MipmapFilterMode::Linear {
-                ::wgpu::FilterMode::Linear
+                ::wgpu::MipmapFilterMode::Linear
             } else {
-                ::wgpu::FilterMode::Nearest
+                ::wgpu::MipmapFilterMode::Nearest
             },
             ..Default::default()
         })
@@ -676,8 +981,8 @@ impl WgpuContext {
         };
         let depth_stencil = key.depth.map(|format| ::wgpu::DepthStencilState {
             format,
-            depth_write_enabled: resource.params.depth_write,
-            depth_compare: compare(resource.params.depth_test),
+            depth_write_enabled: Some(resource.params.depth_write),
+            depth_compare: Some(compare(resource.params.depth_test)),
             stencil: Default::default(),
             bias: resource
                 .params
@@ -696,12 +1001,14 @@ impl WgpuContext {
                 layout: Some(&shader.pipeline_layout),
                 vertex: ::wgpu::VertexState {
                     module: &shader.module,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
+                    compilation_options: Default::default(),
                     buffers: &layouts,
                 },
                 fragment: Some(::wgpu::FragmentState {
                     module: &shader.module,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
+                    compilation_options: Default::default(),
                     targets: &[Some(::wgpu::ColorTargetState {
                         format: key.format,
                         blend: blend_state,
@@ -731,7 +1038,8 @@ impl WgpuContext {
                     count: key.samples,
                     ..Default::default()
                 },
-                multiview: None,
+                multiview_mask: None,
+                cache: None,
             });
         self.pipelines[id.0]
             .as_mut()
@@ -741,8 +1049,8 @@ impl WgpuContext {
     }
 
     fn encode_pass(&mut self, recording: PassRecording, encoder: &mut ::wgpu::CommandEncoder) {
-        if recording.target.is_none() {
-            self.ensure_surface_frame();
+        if recording.target.is_none() && !self.ensure_surface_frame() {
+            return;
         }
         let needs_depth = recording.draws.iter().any(|draw| {
             let params = &self.pipelines[draw.pipeline.0].as_ref().unwrap().params;
@@ -827,6 +1135,7 @@ impl WgpuContext {
             .map(|(view, resolve)| {
                 Some(::wgpu::RenderPassColorAttachment {
                     view,
+                    depth_slice: None,
                     resolve_target: *resolve,
                     ops: ::wgpu::Operations {
                         load: clear_color
@@ -864,6 +1173,7 @@ impl WgpuContext {
             depth_stencil_attachment: depth_attachment,
             timestamp_writes: None,
             occlusion_query_set: None,
+            multiview_mask: None,
         });
         let mut active_pipeline = None;
         let mut active_vertices: SmallVec<[BufferId; 4]> = SmallVec::new();
@@ -1016,7 +1326,8 @@ impl RenderingBackend for WgpuContext {
                     .into(),
             )),
         };
-        self.device
+        let error_scope = self
+            .device
             .push_error_scope(::wgpu::ErrorFilter::Validation);
         let module = self
             .device
@@ -1092,11 +1403,11 @@ impl RenderingBackend for WgpuContext {
             self.device
                 .create_pipeline_layout(&::wgpu::PipelineLayoutDescriptor {
                     label: Some("miniquad shader layout"),
-                    bind_group_layouts: &[&bind_group_layout],
-                    push_constant_ranges: &[],
+                    bind_group_layouts: &[Some(&bind_group_layout)],
+                    immediate_size: 0,
                 });
-        self.device.poll(::wgpu::Maintain::Wait);
-        if let Some(error) = pollster::block_on(self.device.pop_error_scope()) {
+        let _ = self.device.poll(::wgpu::PollType::wait_indefinitely());
+        if let Some(error) = pollster::block_on(error_scope.pop()) {
             return Err(ShaderError::CompilationError {
                 shader_type: ShaderType::Vertex,
                 error_message: error.to_string(),
@@ -1328,7 +1639,6 @@ impl RenderingBackend for WgpuContext {
             &buffer.raw,
             0,
             NonZeroU64::new(upload.len() as u64).unwrap(),
-            &self.device,
         );
         staging.copy_from_slice(upload);
         drop(staging);
@@ -1419,6 +1729,7 @@ impl RenderingBackend for WgpuContext {
         }
     }
     fn commit_frame(&mut self) {
+        self.sync_surface_source();
         if self.current_pass.is_some() {
             self.end_render_pass()
         }
@@ -1435,7 +1746,7 @@ impl RenderingBackend for WgpuContext {
         // frames bounds that memory while amortizing the native synchronization.
         self.poll_frame = self.poll_frame.wrapping_add(1) & 7;
         if self.poll_frame == 0 {
-            self.device.poll(::wgpu::Maintain::Poll);
+            let _ = self.device.poll(::wgpu::PollType::Poll);
         }
         for id in self.pending_texture_deletes.drain(..) {
             if let TextureIdInner::Managed(i) = id.0 {
@@ -1527,17 +1838,17 @@ impl WgpuContext {
             _ => 4,
         };
         self.queue.write_texture(
-            ::wgpu::ImageCopyTexture {
+            ::wgpu::TexelCopyTextureInfo {
                 texture: &t.raw,
                 mip_level: mip,
                 origin: ::wgpu::Origin3d { x, y, z: layer },
                 aspect: ::wgpu::TextureAspect::All,
             },
             bytes,
-            ::wgpu::ImageDataLayout {
+            ::wgpu::TexelCopyBufferLayout {
                 offset: 0,
-                bytes_per_row: NonZeroU32::new(w * bpp).map(Into::into),
-                rows_per_image: NonZeroU32::new(h).map(Into::into),
+                bytes_per_row: Some(w * bpp),
+                rows_per_image: Some(h),
             },
             ::wgpu::Extent3d {
                 width: w,
@@ -1567,15 +1878,15 @@ impl WgpuContext {
         });
         let mut encoder = self.device.create_command_encoder(&Default::default());
         encoder.copy_texture_to_buffer(
-            ::wgpu::ImageCopyTexture {
+            ::wgpu::TexelCopyTextureInfo {
                 texture: &t.raw,
                 mip_level: 0,
                 origin: Default::default(),
                 aspect: ::wgpu::TextureAspect::All,
             },
-            ::wgpu::ImageCopyBuffer {
+            ::wgpu::TexelCopyBufferInfo {
                 buffer: &staging,
-                layout: ::wgpu::ImageDataLayout {
+                layout: ::wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(padded),
                     rows_per_image: Some(t.params.height),
@@ -1593,7 +1904,7 @@ impl WgpuContext {
         slice.map_async(::wgpu::MapMode::Read, move |r| {
             let _ = done_tx.send(r);
         });
-        self.device.poll(::wgpu::Maintain::Wait);
+        let _ = self.device.poll(::wgpu::PollType::wait_indefinitely());
         done_rx.recv().unwrap().unwrap();
         let mapped = slice.get_mapped_range();
         for (y, dst) in bytes.chunks_mut(row as usize).enumerate() {
@@ -1605,7 +1916,8 @@ impl WgpuContext {
 
 #[cfg(test)]
 mod tests {
-    use super::aligned_buffer_size;
+    use super::{aligned_buffer_size, backend_candidates, BackendPlatform};
+    use crate::conf::WgpuBackend;
 
     #[test]
     fn buffer_upload_sizes_respect_wgpu_alignment() {
@@ -1614,5 +1926,29 @@ mod tests {
         assert_eq!(aligned_buffer_size(4), 4);
         assert_eq!(aligned_buffer_size(6), 8);
         assert_eq!(aligned_buffer_size(8), 8);
+    }
+
+    #[test]
+    fn android_auto_tries_vulkan_before_gles() {
+        let candidates = backend_candidates(WgpuBackend::Auto, BackendPlatform::Android);
+        assert_eq!(
+            candidates,
+            vec![
+                (::wgpu::Backends::VULKAN, "Vulkan"),
+                (::wgpu::Backends::GL, "GLES"),
+            ]
+        );
+    }
+
+    #[test]
+    fn explicit_android_backend_does_not_fall_back() {
+        assert_eq!(
+            backend_candidates(WgpuBackend::Vulkan, BackendPlatform::Android),
+            vec![(::wgpu::Backends::VULKAN, "Vulkan")]
+        );
+        assert_eq!(
+            backend_candidates(WgpuBackend::Gles, BackendPlatform::Android),
+            vec![(::wgpu::Backends::GL, "GLES")]
+        );
     }
 }

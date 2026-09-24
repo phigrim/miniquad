@@ -6,7 +6,16 @@ use crate::{
     },
 };
 
-use std::{cell::RefCell, sync::mpsc, thread, time::Duration};
+use std::{
+    cell::RefCell,
+    ptr::NonNull,
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
+
+#[cfg(feature = "wgpu")]
+use std::sync::Mutex;
 
 pub use crate::native::gl::{self, *};
 
@@ -47,9 +56,11 @@ enum Message {
         height: i32,
     },
     SurfaceCreated {
-        window: *mut ndk_sys::ANativeWindow,
+        window: AndroidNativeWindow,
     },
-    SurfaceDestroyed,
+    SurfaceDestroyed {
+        acknowledged: mpsc::SyncSender<()>,
+    },
     Touch {
         phase: TouchPhase,
         touch_id: u64,
@@ -82,7 +93,61 @@ enum Message {
     ImeAction(i32),
     Request(crate::native::Request),
 }
-unsafe impl Send for Message {}
+
+/// Owns the reference returned by `ANativeWindow_fromSurface`.
+pub(crate) struct AndroidNativeWindow(NonNull<ndk_sys::ANativeWindow>);
+
+impl AndroidNativeWindow {
+    pub(crate) fn as_ptr(&self) -> *mut ndk_sys::ANativeWindow {
+        self.0.as_ptr()
+    }
+}
+
+impl std::fmt::Debug for AndroidNativeWindow {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_tuple("AndroidNativeWindow")
+            .field(&self.0)
+            .finish()
+    }
+}
+
+// ANativeWindow is a thread-safe, reference-counted NDK object. The wrapper
+// owns one acquired reference and exposes only an immutable handle; its final
+// release may therefore happen on whichever thread drops the last owner.
+unsafe impl Send for AndroidNativeWindow {}
+unsafe impl Sync for AndroidNativeWindow {}
+
+impl Drop for AndroidNativeWindow {
+    fn drop(&mut self) {
+        unsafe { ndk_sys::ANativeWindow_release(self.as_ptr()) };
+    }
+}
+
+#[cfg(feature = "wgpu")]
+#[derive(Default)]
+pub(crate) struct AndroidSurfaceSource {
+    snapshot: Mutex<crate::native::SurfaceLifecycle<Arc<AndroidNativeWindow>>>,
+}
+
+#[cfg(feature = "wgpu")]
+impl AndroidSurfaceSource {
+    fn surface_created(&self, window: Arc<AndroidNativeWindow>) {
+        self.snapshot.lock().unwrap().created(window);
+    }
+
+    fn surface_destroyed(&self) {
+        self.snapshot.lock().unwrap().destroyed();
+    }
+
+    fn surface_changed(&self, width: i32, height: i32) {
+        self.snapshot.lock().unwrap().resized(width, height);
+    }
+
+    pub(crate) fn snapshot(&self) -> crate::native::SurfaceLifecycle<Arc<AndroidNativeWindow>> {
+        self.snapshot.lock().unwrap().clone()
+    }
+}
 
 thread_local! {
     static MESSAGES_TX: RefCell<Option<mpsc::Sender<Message>>> = RefCell::new(None);
@@ -138,22 +203,37 @@ pub unsafe fn console_error(msg: *const ::core::ffi::c_char) {
 //     unsafe { console_info(msg.as_ptr()) };
 // }
 
-struct MainThreadState {
+struct OpenGlContext {
     libegl: LibEgl,
     egl_display: egl::EGLDisplay,
     egl_config: egl::EGLConfig,
     egl_context: egl::EGLContext,
     surface: egl::EGLSurface,
-    window: *mut ndk_sys::ANativeWindow,
+    window: Option<Arc<AndroidNativeWindow>>,
+}
+
+enum AndroidGraphicsContext {
+    OpenGl(OpenGlContext),
+    #[cfg(feature = "wgpu")]
+    Wgpu(Arc<AndroidSurfaceSource>),
+}
+
+struct MainThreadState {
+    graphics: AndroidGraphicsContext,
     event_handler: Box<dyn EventHandler>,
     quit: bool,
     fullscreen: bool,
     update_requested: bool,
+    surface_sync_requested: bool,
+    pending_surface_destroy_acks: Vec<mpsc::SyncSender<()>>,
     keymods: KeyMods,
 }
 
-impl MainThreadState {
+impl OpenGlContext {
     unsafe fn destroy_surface(&mut self) {
+        if self.surface.is_null() {
+            return;
+        }
         (self.libegl.eglMakeCurrent)(
             self.egl_display,
             std::ptr::null_mut(),
@@ -164,19 +244,14 @@ impl MainThreadState {
         self.surface = std::ptr::null_mut();
     }
 
-    unsafe fn update_surface(&mut self, window: *mut ndk_sys::ANativeWindow) {
-        if !self.window.is_null() {
-            ndk_sys::ANativeWindow_release(self.window);
-        }
-        self.window = window;
-        if self.surface.is_null() == false {
-            self.destroy_surface();
-        }
+    unsafe fn update_surface(&mut self, window: Arc<AndroidNativeWindow>) {
+        self.destroy_surface();
+        self.window = Some(window);
 
         self.surface = (self.libegl.eglCreateWindowSurface)(
             self.egl_display,
             self.egl_config,
-            window as _,
+            self.window.as_ref().unwrap().as_ptr() as _,
             std::ptr::null_mut(),
         );
 
@@ -191,22 +266,70 @@ impl MainThreadState {
 
         assert!(res != 0);
     }
+}
+
+impl MainThreadState {
+    fn has_surface(&self) -> bool {
+        match &self.graphics {
+            AndroidGraphicsContext::OpenGl(context) => !context.surface.is_null(),
+            #[cfg(feature = "wgpu")]
+            AndroidGraphicsContext::Wgpu(source) => source.snapshot().ready,
+        }
+    }
+
+    fn is_wgpu(&self) -> bool {
+        #[cfg(feature = "wgpu")]
+        if matches!(self.graphics, AndroidGraphicsContext::Wgpu(_)) {
+            return true;
+        }
+        false
+    }
 
     fn process_message(&mut self, msg: Message) {
         match msg {
-            Message::SurfaceCreated { window } => unsafe {
-                self.update_surface(window);
-            },
-            Message::SurfaceDestroyed => unsafe {
-                self.destroy_surface();
-            },
+            Message::SurfaceCreated { window } => {
+                let window = Arc::new(window);
+                match &mut self.graphics {
+                    AndroidGraphicsContext::OpenGl(context) => unsafe {
+                        context.update_surface(window);
+                    },
+                    #[cfg(feature = "wgpu")]
+                    AndroidGraphicsContext::Wgpu(source) => {
+                        source.surface_created(window);
+                        self.surface_sync_requested = true;
+                    }
+                }
+                self.update_requested = true;
+            }
+            Message::SurfaceDestroyed { acknowledged } => {
+                match &mut self.graphics {
+                    AndroidGraphicsContext::OpenGl(context) => unsafe {
+                        context.destroy_surface();
+                        context.window = None;
+                        let _ = acknowledged.send(());
+                    },
+                    #[cfg(feature = "wgpu")]
+                    AndroidGraphicsContext::Wgpu(source) => {
+                        source.surface_destroyed();
+                        self.surface_sync_requested = true;
+                        self.pending_surface_destroy_acks.push(acknowledged);
+                    }
+                }
+                self.update_requested = true;
+            }
             Message::SurfaceChanged { width, height } => {
                 {
                     let mut d = crate::native_display().lock().unwrap();
-                    d.screen_width = width as _;
-                    d.screen_height = height as _;
+                    d.screen_width = width.max(0);
+                    d.screen_height = height.max(0);
+                }
+                #[cfg(feature = "wgpu")]
+                if let AndroidGraphicsContext::Wgpu(source) = &self.graphics {
+                    source.surface_changed(width, height);
+                    self.surface_sync_requested = true;
                 }
                 self.event_handler.resize_event(width as _, height as _);
+                self.update_requested = true;
             }
             Message::Touch {
                 phase,
@@ -295,15 +418,35 @@ impl MainThreadState {
     }
 
     fn frame(&mut self) {
+        self.update_requested = false;
         self.event_handler.update();
 
-        if self.surface.is_null() == false {
-            self.update_requested = false;
+        let has_surface = self.has_surface();
+        if has_surface || (self.is_wgpu() && self.surface_sync_requested) {
             self.event_handler.draw();
 
-            unsafe {
-                (self.libegl.eglSwapBuffers)(self.egl_display, self.surface);
+            if let AndroidGraphicsContext::OpenGl(context) = &self.graphics {
+                unsafe {
+                    (context.libegl.eglSwapBuffers)(context.egl_display, context.surface);
+                }
             }
+            self.surface_sync_requested = false;
+            for acknowledged in self.pending_surface_destroy_acks.drain(..) {
+                let _ = acknowledged.send(());
+            }
+        }
+    }
+
+    unsafe fn shutdown_graphics(&mut self) {
+        match &mut self.graphics {
+            AndroidGraphicsContext::OpenGl(context) => {
+                context.destroy_surface();
+                (context.libegl.eglDestroyContext)(context.egl_display, context.egl_context);
+                (context.libegl.eglTerminate)(context.egl_display);
+                context.window = None;
+            }
+            #[cfg(feature = "wgpu")]
+            AndroidGraphicsContext::Wgpu(source) => source.surface_destroyed(),
         }
     }
 
@@ -473,76 +616,119 @@ where
     MESSAGES_TX.with(move |messages_tx| *messages_tx.borrow_mut() = Some(tx2));
 
     thread::spawn(move || {
-        let mut libegl = LibEgl::try_load().expect("Cant load LibEGL");
+        let mut window: Option<Arc<AndroidNativeWindow>> = None;
+        let mut screen_width = 0;
+        let mut screen_height = 0;
+        let mut surface_ready = false;
+        let mut queued_messages = Vec::new();
+        #[cfg(feature = "wgpu")]
+        let surface_source = Arc::new(AndroidSurfaceSource::default());
 
-        // skip all the messages until android will be able to actually open a window
-        //
-        // sometimes before launching an app android will show a permission dialog
-        // it is important to create GL context only after a first SurfaceChanged
-        let window = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceCreated { window }) => {
-                    break 'a window;
+        // Wait without spinning and retain non-surface lifecycle/input events
+        // until the handler exists. A Surface is usable only after both its
+        // native window and a positive size have arrived.
+        loop {
+            let message = match rx.recv() {
+                Ok(message) => message,
+                Err(_) => return,
+            };
+            match message {
+                Message::SurfaceCreated { window: created } => {
+                    let created = Arc::new(created);
+                    window = Some(created.clone());
+                    surface_ready = false;
+                    #[cfg(feature = "wgpu")]
+                    if conf.platform.prefer_gfx_api == crate::conf::GfxApi::Wgpu {
+                        surface_source.surface_created(created);
+                    }
                 }
-                _ => {}
-            }
-        };
-        let (screen_width, screen_height) = 'a: loop {
-            match rx.try_recv() {
-                Ok(Message::SurfaceChanged { width, height }) => {
-                    break 'a (width as f32, height as f32);
+                Message::SurfaceDestroyed { acknowledged } => {
+                    window = None;
+                    surface_ready = false;
+                    #[cfg(feature = "wgpu")]
+                    if conf.platform.prefer_gfx_api == crate::conf::GfxApi::Wgpu {
+                        surface_source.surface_destroyed();
+                    }
+                    let _ = acknowledged.send(());
                 }
-                _ => {}
+                Message::SurfaceChanged { width, height } => {
+                    screen_width = width.max(0);
+                    screen_height = height.max(0);
+                    surface_ready = window.is_some() && width > 0 && height > 0;
+                    #[cfg(feature = "wgpu")]
+                    if conf.platform.prefer_gfx_api == crate::conf::GfxApi::Wgpu {
+                        surface_source.surface_changed(width, height);
+                    }
+                }
+                Message::Destroy => return,
+                other => queued_messages.push(other),
             }
-        };
-
-        let (egl_context, egl_config, egl_display) = crate::native::egl::create_egl_context(
-            &mut libegl,
-            std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
-            conf.platform.framebuffer_alpha,
-            conf.sample_count,
-        )
-        .expect("Cant create EGL context");
-
-        assert!(!egl_display.is_null());
-        assert!(!egl_config.is_null());
-
-        crate::native::gl::load_gl_funcs(|proc| {
-            let name = std::ffi::CString::new(proc).unwrap();
-            (libegl.eglGetProcAddress)(name.as_ptr() as _)
-        });
-
-        let surface = (libegl.eglCreateWindowSurface)(
-            egl_display,
-            egl_config,
-            window as _,
-            std::ptr::null_mut(),
-        );
-
-        if (libegl.eglMakeCurrent)(egl_display, surface, surface, egl_context) == 0 {
-            panic!();
+            if surface_ready {
+                break;
+            }
         }
+
+        let graphics = match conf.platform.prefer_gfx_api {
+            #[cfg(feature = "wgpu")]
+            crate::conf::GfxApi::Wgpu => AndroidGraphicsContext::Wgpu(surface_source.clone()),
+            crate::conf::GfxApi::OpenGl => {
+                let mut libegl = LibEgl::try_load().expect("failed to load LibEGL for OpenGL");
+                let (egl_context, egl_config, egl_display) =
+                    crate::native::egl::create_egl_context(
+                        &mut libegl,
+                        std::ptr::null_mut(), /* EGL_DEFAULT_DISPLAY */
+                        conf.platform.framebuffer_alpha,
+                        conf.sample_count,
+                    )
+                    .expect("failed to create EGL context");
+
+                assert!(!egl_display.is_null());
+                assert!(!egl_config.is_null());
+
+                crate::native::gl::load_gl_funcs(|proc| {
+                    let name = std::ffi::CString::new(proc).unwrap();
+                    (libegl.eglGetProcAddress)(name.as_ptr() as _)
+                });
+
+                let mut context = OpenGlContext {
+                    libegl,
+                    egl_display,
+                    egl_config,
+                    egl_context,
+                    surface: std::ptr::null_mut(),
+                    window: None,
+                };
+                unsafe { context.update_surface(window.as_ref().unwrap().clone()) };
+                AndroidGraphicsContext::OpenGl(context)
+            }
+        };
+        drop(window);
 
         let clipboard = Box::new(AndroidClipboard::new());
         let tx_fn = Box::new(move |req| tx.send(Message::Request(req)).unwrap());
-        crate::set_or_replace_display(NativeDisplayData {
-            high_dpi: conf.high_dpi,
-            blocking_event_loop: conf.platform.blocking_event_loop,
-            ..NativeDisplayData::new(screen_width as _, screen_height as _, tx_fn, clipboard)
-        });
+        let mut display = NativeDisplayData::new(screen_width, screen_height, tx_fn, clipboard);
+        display.high_dpi = conf.high_dpi;
+        display.blocking_event_loop = conf.platform.blocking_event_loop;
+        display.gfx_api = conf.platform.prefer_gfx_api;
+        display.swap_interval = conf.platform.swap_interval;
+        #[cfg(feature = "wgpu")]
+        {
+            display.wgpu_backend = conf.platform.wgpu_backend;
+            if conf.platform.prefer_gfx_api == crate::conf::GfxApi::Wgpu {
+                display.android_surface_source = surface_source.clone();
+            }
+        }
+        crate::set_or_replace_display(display);
 
         let event_handler = f.0();
         let mut s = MainThreadState {
-            libegl,
-            egl_display,
-            egl_config,
-            egl_context,
-            surface,
-            window,
+            graphics,
             event_handler,
             quit: false,
             fullscreen: conf.fullscreen,
             update_requested: true,
+            surface_sync_requested: false,
+            pending_surface_destroy_acks: Vec::new(),
             keymods: KeyMods {
                 shift: false,
                 ctrl: false,
@@ -550,6 +736,9 @@ where
                 logo: false,
             },
         };
+        for message in queued_messages {
+            s.process_message(message);
+        }
 
         let rx_timeout = conf
             .platform
@@ -583,15 +772,7 @@ where
             thread::yield_now();
         }
 
-        (s.libegl.eglMakeCurrent)(
-            s.egl_display,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        );
-        (s.libegl.eglDestroySurface)(s.egl_display, s.surface);
-        (s.libegl.eglDestroyContext)(s.egl_display, s.egl_context);
-        (s.libegl.eglTerminate)(s.egl_display);
+        unsafe { s.shutdown_graphics() };
     });
 }
 
@@ -615,15 +796,14 @@ extern "C" fn jni_on_load(vm: *mut std::ffi::c_void) {
     }
 }
 
-unsafe fn create_native_window(surface: ndk_sys::jobject) -> *mut ndk_sys::ANativeWindow {
+unsafe fn create_native_window(surface: ndk_sys::jobject) -> Option<AndroidNativeWindow> {
     let env = attach_jni_env();
-
-    ndk_sys::ANativeWindow_fromSurface(env, surface)
+    NonNull::new(ndk_sys::ANativeWindow_fromSurface(env, surface)).map(AndroidNativeWindow)
 }
 
 #[no_mangle]
 pub unsafe extern "C" fn Java_quad_1native_QuadNative_initializeContext(
-    env: *mut ndk_sys::JNIEnv,
+    _env: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
     activity: ndk_sys::jobject,
 ) {
@@ -685,7 +865,11 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceCreated(
     _: ndk_sys::jobject,
     surface: ndk_sys::jobject,
 ) {
-    let window = unsafe { create_native_window(surface) };
+    let Some(window) = (unsafe { create_native_window(surface) }) else {
+        let message = b"ANativeWindow_fromSurface returned null\0";
+        unsafe { console_error(message.as_ptr() as _) };
+        return;
+    };
     send_message(Message::SurfaceCreated { window });
 }
 
@@ -694,7 +878,11 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceDestroyed(
     _: *mut ndk_sys::JNIEnv,
     _: ndk_sys::jobject,
 ) {
-    send_message(Message::SurfaceDestroyed);
+    let (acknowledged_tx, acknowledged_rx) = mpsc::sync_channel(0);
+    send_message(Message::SurfaceDestroyed {
+        acknowledged: acknowledged_tx,
+    });
+    let _ = acknowledged_rx.recv();
 }
 
 #[no_mangle]

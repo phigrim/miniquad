@@ -10,7 +10,12 @@ mod gl;
 
 #[cfg(all(
     feature = "wgpu",
-    any(target_os = "windows", target_os = "linux", target_os = "macos")
+    any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )
 ))]
 mod wgpu;
 
@@ -23,7 +28,12 @@ pub use gl::GlContext;
 
 #[cfg(all(
     feature = "wgpu",
-    any(target_os = "windows", target_os = "linux", target_os = "macos")
+    any(
+        target_os = "windows",
+        target_os = "linux",
+        target_os = "macos",
+        target_os = "android"
+    )
 ))]
 pub use self::wgpu::WgpuContext;
 

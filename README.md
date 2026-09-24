@@ -17,7 +17,18 @@ Miniquad aims to provide a graphics abstraction that works the same way on any p
 * macOS, OpenGL 3, Metal;
 * iOS, GLES 2, GLES 3, Metal;
 * WASM, WebGL 1 - tested on iOS Safari, Firefox, Chrome;
-* Android, GLES 2, GLES 3.
+* Android, GLES 2, GLES 3; optional WGPU through Vulkan or GLES.
+
+## Optional WGPU backend
+
+Enable the `wgpu` Cargo feature to use Miniquad's WGPU renderer. Desktop builds
+use the winit window path. Android keeps Miniquad's Java/JNI runner and supplies
+the current native `Surface` to WGPU; `WgpuBackend::Auto` tries Vulkan first,
+then GLES. Selecting `WgpuBackend::Vulkan` or `WgpuBackend::Gles` forces that
+backend, and failure does not fall back to Miniquad OpenGL.
+
+Miniquad builds without `wgpu` retain the Rust 1.70 minimum supported version.
+Enabling `wgpu` uses wgpu 29 and requires Rust 1.87 or newer.
 
 ## Examples
 
