@@ -322,19 +322,18 @@ fn wgpu_adapter_for_target(
                 continue;
             }
         };
-        let adapter = match pollster::block_on(instance.request_adapter(
-            &::wgpu::RequestAdapterOptions {
+        let adapter =
+            match pollster::block_on(instance.request_adapter(&::wgpu::RequestAdapterOptions {
                 power_preference: ::wgpu::PowerPreference::HighPerformance,
                 force_fallback_adapter: false,
                 compatible_surface: Some(&surface),
-            },
-        )) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                failures.push(format!("{name}: no compatible adapter: {error}"));
-                continue;
-            }
-        };
+            })) {
+                Ok(adapter) => adapter,
+                Err(error) => {
+                    failures.push(format!("{name}: no compatible adapter: {error}"));
+                    continue;
+                }
+            };
         let surface_config = match surface_configuration(&surface, &adapter, size, swap_interval) {
             Ok(config) => config,
             Err(error) => {
@@ -343,20 +342,19 @@ fn wgpu_adapter_for_target(
             }
         };
         let limits = ::wgpu::Limits::downlevel_defaults().using_resolution(adapter.limits());
-        let (device, queue) = match pollster::block_on(adapter.request_device(
-            &::wgpu::DeviceDescriptor {
+        let (device, queue) =
+            match pollster::block_on(adapter.request_device(&::wgpu::DeviceDescriptor {
                 label: Some("miniquad wgpu device"),
                 required_features: ::wgpu::Features::empty(),
                 required_limits: limits,
                 ..Default::default()
-            },
-        )) {
-            Ok(device_and_queue) => device_and_queue,
-            Err(error) => {
-                failures.push(format!("{name}: device creation failed: {error}"));
-                continue;
-            }
-        };
+            })) {
+                Ok(device_and_queue) => device_and_queue,
+                Err(error) => {
+                    failures.push(format!("{name}: device creation failed: {error}"));
+                    continue;
+                }
+            };
         let error_scope = device.push_error_scope(::wgpu::ErrorFilter::Validation);
         surface.configure(&device, &surface_config);
         let _ = device.poll(::wgpu::PollType::wait_indefinitely());

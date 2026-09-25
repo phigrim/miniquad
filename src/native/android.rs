@@ -54,6 +54,8 @@ enum Message {
     SurfaceChanged {
         width: i32,
         height: i32,
+        density: f32,
+        font_scale: f32,
     },
     SurfaceCreated {
         window: AndroidNativeWindow,
@@ -317,11 +319,26 @@ impl MainThreadState {
                 }
                 self.update_requested = true;
             }
-            Message::SurfaceChanged { width, height } => {
+            Message::SurfaceChanged {
+                width,
+                height,
+                density,
+                font_scale,
+            } => {
+                assert!(
+                    density.is_finite() && density > 0.0,
+                    "Android density must be positive"
+                );
+                assert!(
+                    font_scale.is_finite() && font_scale > 0.0,
+                    "Android font scale must be positive"
+                );
                 {
                     let mut d = crate::native_display().lock().unwrap();
                     d.screen_width = width.max(0);
                     d.screen_height = height.max(0);
+                    d.dpi_scale = density;
+                    d.font_scale = font_scale;
                 }
                 #[cfg(feature = "wgpu")]
                 if let AndroidGraphicsContext::Wgpu(source) = &self.graphics {
@@ -338,8 +355,14 @@ impl MainThreadState {
                 y,
                 time,
             } => {
-                self.event_handler
-                    .touch_event(phase, touch_id, x, y, time as f64 / 1000.);
+                let density = crate::native_display().lock().unwrap().dpi_scale;
+                self.event_handler.touch_event(
+                    phase,
+                    touch_id,
+                    x / density,
+                    y / density,
+                    time as f64 / 1000.,
+                );
             }
             Message::Character { character } => {
                 if let Some(character) = char::from_u32(character) {
@@ -619,6 +642,8 @@ where
         let mut window: Option<Arc<AndroidNativeWindow>> = None;
         let mut screen_width = 0;
         let mut screen_height = 0;
+        let mut density = 1.0;
+        let mut font_scale = 1.0;
         let mut surface_ready = false;
         let mut queued_messages = Vec::new();
         #[cfg(feature = "wgpu")]
@@ -651,9 +676,16 @@ where
                     }
                     let _ = acknowledged.send(());
                 }
-                Message::SurfaceChanged { width, height } => {
+                Message::SurfaceChanged {
+                    width,
+                    height,
+                    density: changed_density,
+                    font_scale: changed_font_scale,
+                } => {
                     screen_width = width.max(0);
                     screen_height = height.max(0);
+                    density = changed_density;
+                    font_scale = changed_font_scale;
                     surface_ready = window.is_some() && width > 0 && height > 0;
                     #[cfg(feature = "wgpu")]
                     if conf.platform.prefer_gfx_api == crate::conf::GfxApi::Wgpu {
@@ -667,6 +699,15 @@ where
                 break;
             }
         }
+
+        assert!(
+            density.is_finite() && density > 0.0,
+            "Android density must be positive"
+        );
+        assert!(
+            font_scale.is_finite() && font_scale > 0.0,
+            "Android font scale must be positive"
+        );
 
         let graphics = match conf.platform.prefer_gfx_api {
             #[cfg(feature = "wgpu")]
@@ -708,6 +749,8 @@ where
         let tx_fn = Box::new(move |req| tx.send(Message::Request(req)).unwrap());
         let mut display = NativeDisplayData::new(screen_width, screen_height, tx_fn, clipboard);
         display.high_dpi = conf.high_dpi;
+        display.dpi_scale = density;
+        display.font_scale = font_scale;
         display.blocking_event_loop = conf.platform.blocking_event_loop;
         display.gfx_api = conf.platform.prefer_gfx_api;
         display.swap_interval = conf.platform.swap_interval;
@@ -892,10 +935,14 @@ extern "C" fn Java_quad_1native_QuadNative_surfaceOnSurfaceChanged(
     _: ndk_sys::jobject,
     width: ndk_sys::jint,
     height: ndk_sys::jint,
+    density: ndk_sys::jfloat,
+    font_scale: ndk_sys::jfloat,
 ) {
     send_message(Message::SurfaceChanged {
         width: width as _,
         height: height as _,
+        density,
+        font_scale,
     });
 }
 

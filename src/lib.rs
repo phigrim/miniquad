@@ -179,6 +179,13 @@ pub mod window {
         d.dpi_scale
     }
 
+    /// The operating-system text scale, used to resolve Android `sp` values.
+    /// It is `1.0` on platforms without a user-configurable text scale.
+    pub fn font_scale() -> f32 {
+        let d = native_display().lock().unwrap();
+        d.font_scale
+    }
+
     /// True when high_dpi was requested and actually running in a high-dpi scenario
     /// NOTE: [High DPI Rendering](../conf/index.html#high-dpi-rendering)
     pub fn high_dpi() -> bool {
